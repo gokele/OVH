@@ -24,6 +24,8 @@ import (
 	"github.com/ovh-buy/server/internal/handlers"
 	"github.com/ovh-buy/server/internal/logger"
 	"github.com/ovh-buy/server/internal/monitor"
+	"github.com/ovh-buy/server/internal/netfp"
+	"github.com/ovh-buy/server/internal/proxyguard"
 	"github.com/ovh-buy/server/internal/purchase"
 	"github.com/ovh-buy/server/internal/secret"
 	"github.com/ovh-buy/server/internal/storage"
@@ -253,6 +255,10 @@ func main() {
 		// Telegram
 		// 收 update 只有长轮询一条路。这个端点只读状态,给设置页显示"收到没收到"。
 		api.GET("/telegram/poller", handlers.GetTelegramPollerStatus(state))
+
+		// 按账户的出站代理:查真实出口 IP(确认隔离生效的唯一可靠手段)+ 健康状况
+		api.POST("/accounts/:id/proxy-test", handlers.TestAccountProxy(state))
+		api.GET("/accounts/proxy-status", handlers.ProxyStatus(state))
 
 		// Servers / availability / cache
 		api.GET("/servers", handlers.GetServers(state))
@@ -513,6 +519,27 @@ func main() {
 	// 预热各账户子公司的区域配置:region 的合法取值要从 10MB 的公开目录里解析,
 	// 首次解析放在抢购链路上会白白慢 2-7 秒
 	go catalog.WarmRegionCache(state)
+	// 按账户的出站代理看门狗:代理连续挂掉就暂停那个账户的任务并通知用户。
+	//
+	// 必须在任何 OVH 调用之前接好 —— SetProxyErrorHook 会清掉已缓存的 client
+	// 让它们带着钩子重建,晚接的话前面那些请求的故障就丢了。
+	proxyguard.Init(state)
+	proxyguard.SetReload(func() {
+		// 库里关掉了自动下单,内存里的 Monitor 还拿着旧值 —— 不重读的话
+		// 自动下单会继续触发,而它的出口已经断了。
+		mon.LoadFromDB()
+	})
+	state.OVH.SetProxyErrorHook(proxyguard.Report)
+	// 不带凭据但仍打 OVH 的那些请求(公开目录、VPS 可用性轮询)也要上报
+	state.SetProxyErrorHook(proxyguard.Report)
+	// 公开目录/区域探测这类跨账户共享的请求走统一出口:默认账户配了代理就用它,
+	// 否则直连。这不是按账户隔离(共享缓存本来就没这个维度),
+	// 只是别拿本机真实 IP 去打 OVH。
+	applySharedProxy(state)
+	state.OVH.SetLogf(func(format string, args ...interface{}) {
+		state.Logger.Warn(fmt.Sprintf(format, args...), "proxy")
+	})
+
 	// 长轮询:配了 Token 就拉起来。
 	// 内部会先 deleteWebhook —— 老版本可能在 Telegram 那边注册过 webhook,
 	// 不摘掉的话 getUpdates 会一直失败。
@@ -757,4 +784,20 @@ func allowedOrigins(port string) []string {
 		}
 	}
 	return out
+}
+
+// applySharedProxy 把默认账户的代理设为"公开请求"的统一出口。
+// 账户增删改之后需要重调 —— 默认账户可能换了。
+func applySharedProxy(state *app.State) {
+	acc, ok := state.FindAccount("")
+	if !ok {
+		return
+	}
+	if err := netfp.SetSharedProxy(acc.ProxyURL); err != nil {
+		state.Logger.Warn("公开请求的统一出口设置失败,将走直连: "+err.Error(), "proxy")
+		return
+	}
+	if p := netfp.SharedProxy(); p != "" {
+		state.Logger.Info("公开目录/区域探测统一走: "+p, "proxy")
+	}
 }

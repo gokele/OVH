@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { Settings as SettingsIcon, KeyRound, Globe, Send, Database, Save, AlertTriangle, CheckCircle2, Plus, Star, RotateCw, Trash2, Pencil, BellRing, RefreshCw, Radio } from "lucide-react";
+import { Settings as SettingsIcon, KeyRound, Globe, Send, Database, Save, AlertTriangle, CheckCircle2, Plus, Star, RotateCw, Trash2, Pencil, BellRing, RefreshCw, Radio, Network, Fingerprint, ShieldAlert, Radar, Ban } from "lucide-react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { LoadFailed, LoadFailedBanner } from "@/components/common/LoadFailed";
@@ -31,8 +31,15 @@ import {
   useDeleteAccount,
   useSetDefaultAccount,
   useVerifyAccount,
+  useProxyStatus,
+  useProxyTest,
+  useLastProxyTest,
+  useLastProxyTests,
   accountChipColor,
   type OVHAccount,
+  type AccountInput,
+  type AccountProxyStatus,
+  type ProxyTestRecord,
 } from "@/hooks/use-accounts";
 
 /** 根据 zone 推 endpoint */
@@ -538,21 +545,92 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
 
 function AccountsSection() {
   const accounts = useAccounts();
+  // 代理健康:30 秒一轮。跳闸的账户,它的抢购任务已经被后端停掉了 ——
+  // 这件事不在界面上说,用户看到的现象只是"这个账户一直抢不到"。
+  const health = useProxyStatus();
   const [showAdd, setShowAdd] = useState(false);
   const [editAcc, setEditAcc] = useState<OVHAccount | null>(null);
   const list = accounts.data || [];
+  const healthByID = new Map((health.data?.accounts || []).map((h) => [h.id, h]));
+
+  // 各账户最近一次测到的出口 IP,按 IP 归堆。撞在同一个 IP 上的必须挑出来说 ——
+  // 这正是"隔离有没有生效"的唯一判据,而它只有把多个账户放在一起才看得出来。
+  const tests = useLastProxyTests(list.map((a) => a.id));
+  const byIP = new Map<string, { name: string; hasProxy: boolean }[]>();
+  list.forEach((a, i) => {
+    const r = tests[i]?.data;
+    if (!r || !r.success) return;
+    byIP.set(r.egressIP, [...(byIP.get(r.egressIP) || []), { name: a.name, hasProxy: !!a.proxyUrl }]);
+  });
+  const collisions = Array.from(byIP.entries())
+    .filter(([, xs]) => xs.length > 1)
+    // 撞车里有配了代理的账户,性质就完全不同了:那不是"正常共用出口",是代理没生效
+    .map(([ip, xs]) => ({ ip, xs, proxied: xs.some((x) => x.hasProxy) }));
+  const proxiedCollision = collisions.some((c) => c.proxied);
 
   return (
     <Section title="OVH 账户管理">
-      <div className="flex items-center justify-between">
+      <div className="flex items-start justify-between gap-3">
         <p className="text-[12px] text-muted-foreground">
           每个 OVH 账户(凭据)单独保存,抢购队列 / 狙击 / 订阅创建时各自指定账户。删账户会一并清除关联的 queue / history / sniper tasks。
         </p>
-        <Button onClick={() => setShowAdd(true)} size="sm">
+        <Button onClick={() => setShowAdd(true)} size="sm" className="flex-shrink-0">
           <Plus className="w-4 h-4" />
           添加账户
         </Button>
       </div>
+
+      {/* 为什么每个账户要有自己的出口 —— 不讲清楚,代理这一栏看起来只是个可选项 */}
+      <div className="rounded-xl border border-border bg-secondary/30 px-3 py-2.5 space-y-1.5 text-[11px] leading-relaxed">
+        <p className="font-semibold flex items-center gap-1.5">
+          <Network className="w-3.5 h-3.5" />
+          每个账户可以配自己的出站代理
+        </p>
+        <p className="text-muted-foreground">
+          OVH 的限流按来源 IP 算。多个账户共用一个出口时,一个账户被限流会把其它账户一起拖下水 ——
+          而这恰好发生在补货那一刻,也就是唯一要紧的时刻。
+        </p>
+        <p className="text-muted-foreground">
+          代理配错或连不上时,后端<b className="text-warning">不会</b>退回直连,请求直接失败。这是故意的 ——
+          悄悄直连的表现是一切正常、隔离却已经没了,而你无从察觉。
+        </p>
+      </div>
+
+      {/* 健康状态没问到时,下面各卡片"没有告警"并不等于"没问题" */}
+      {health.isError && (
+        <LoadFailedBanner
+          title="代理健康状态读取失败 —— 各账户有没有因为代理故障被暂停,现在是未知"
+          error={health.error}
+          onRetry={() => health.refetch()}
+        />
+      )}
+
+      {collisions.length > 0 && (
+        <div
+          className={cn(
+            "rounded-xl border px-3 py-2.5 text-[11px] space-y-1",
+            proxiedCollision ? "border-destructive/40 bg-destructive/5" : "border-warning/40 bg-warning/5"
+          )}
+        >
+          <p className={cn("font-semibold flex items-center gap-1.5", proxiedCollision ? "text-destructive" : "text-warning")}>
+            <AlertTriangle className="w-3.5 h-3.5" />
+            {proxiedCollision
+              ? "配了代理的账户和别人撞在同一个出口 IP 上 —— 隔离没生效"
+              : "这些账户测出来是同一个出口 IP"}
+          </p>
+          {collisions.map((c) => (
+            <p key={c.ip} className="text-muted-foreground">
+              <span className="font-mono font-semibold text-foreground">{c.ip}</span> ←{" "}
+              {c.xs.map((x) => `${x.name}${x.hasProxy ? "(配了代理)" : "(直连)"}`).join("、")}
+            </p>
+          ))}
+          <p className="text-muted-foreground">
+            它们在 OVH 眼里是同一个来源,限流会互相拖累 —— 一个被限,其它一起被限。
+            都是直连的话这是正常的(直连本来就共用一个出口);配了代理却还撞在一起,说明那个代理没生效,
+            去编辑里确认代理地址保存上了、再测一次。
+          </p>
+        </div>
+      )}
 
       {accounts.isError ? (
         // 说成"还没有账户"会让用户重新粘一遍 OVH 三件套凭据,
@@ -579,7 +657,13 @@ function AccountsSection() {
       ) : (
         <div className="space-y-3">
           {list.map((a) => (
-            <AccountCard key={a.id} acc={a} onEdit={() => setEditAcc(a)} />
+            <AccountCard
+              key={a.id}
+              acc={a}
+              onEdit={() => setEditAcc(a)}
+              health={healthByID.get(a.id)}
+              healthUnknown={health.isError || health.isPending}
+            />
           ))}
         </div>
       )}
@@ -590,11 +674,25 @@ function AccountsSection() {
   );
 }
 
-function AccountCard({ acc, onEdit }: { acc: OVHAccount; onEdit: () => void }) {
+function AccountCard({
+  acc,
+  onEdit,
+  health,
+  healthUnknown,
+}: {
+  acc: OVHAccount;
+  onEdit: () => void;
+  /** proxy-status 里这个账户的健康状况。undefined = 没问到,不等于"健康" */
+  health?: AccountProxyStatus;
+  /** 上面那条查询失败或还没回来 —— 此时这张卡上没有告警说明不了任何事 */
+  healthUnknown?: boolean;
+}) {
   const setDefault = useSetDefaultAccount();
   const del = useDeleteAccount();
   const verify = useVerifyAccount();
   const [confirming, setConfirming] = useState(false);
+  // 最近一次出口测试(在编辑框里点的)。摆在卡片上是为了让几个账户的出口 IP 并排可比。
+  const lastTest = useLastProxyTest(acc.id).data;
 
   // 后端 /accounts/:id/verify 除了 valid 还会带 subsidiaryWarning:
   // zone(决定目录站点/币种/下单 region)与 OVH /me 的 ovhSubsidiary 不一致时,凭据依然有效,
@@ -624,6 +722,30 @@ function AccountCard({ acc, onEdit }: { acc: OVHAccount; onEdit: () => void }) {
           <span>·</span>
           <span>建于 {new Date(acc.createdAt).toLocaleDateString("zh-CN")}</span>
         </div>
+        {/* 出站配置 + 最近测到的出口 IP。IP 放在这里就是为了几个账户之间横向比对 */}
+        <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
+          {acc.proxyUrl ? (
+            <Chip tone="info">
+              <Network className="w-3 h-3" />
+              <span className="font-mono">{acc.proxyUrl}</span>
+            </Chip>
+          ) : (
+            <Chip>直连</Chip>
+          )}
+          <Chip>
+            <Fingerprint className="w-3 h-3" />
+            {acc.fingerprint || "default"}
+          </Chip>
+          {lastTest && lastTest.success ? (
+            <Chip tone="success" title={`测于 ${new Date(lastTest.testedAt).toLocaleString("zh-CN")}`}>
+              出口 <span className="font-mono font-semibold">{lastTest.egressIP}</span>
+            </Chip>
+          ) : lastTest ? (
+            <Chip tone="danger" title={lastTest.error}>出口测试失败 · 经由{lastTest.via}</Chip>
+          ) : (
+            <span className="text-[11px] text-muted-foreground">出口 IP 未测(编辑里点「测试出口 IP」)</span>
+          )}
+        </div>
       </div>
       <div className="flex items-center gap-2 flex-shrink-0">
         <Button variant="ghost" size="icon" onClick={() => verify.mutate(acc.id)} disabled={verify.isPending} title="重新验证凭据">
@@ -642,6 +764,33 @@ function AccountCard({ acc, onEdit }: { acc: OVHAccount; onEdit: () => void }) {
         </Button>
       </div>
       </div>
+
+      {/* 代理跳闸:这个账户的活儿已经被停了,必须用 destructive 说清楚,并说明不会自动恢复 */}
+      {health?.tripped ? (
+        <div className="rounded-xl border border-destructive/40 bg-destructive/5 px-3 py-2.5 text-[11px] space-y-1">
+          <p className="font-semibold text-destructive flex items-center gap-1.5">
+            <ShieldAlert className="w-3.5 h-3.5" />
+            出站代理连续失败 {health.fails} 次 —— 该账户的抢购任务已被暂停
+          </p>
+          <p className="text-muted-foreground">
+            订阅的自动下单也一并关掉了(订阅本身还在,补货通知照常发)。
+            {health.trippedAt ? ` 停于 ${new Date(health.trippedAt).toLocaleString("zh-CN")}。` : ""}
+          </p>
+          <p className="text-muted-foreground">
+            代理修好后任务<b>不会</b>自动恢复:去队列页把被暂停的任务改回运行,订阅的自动下单也要重新打开。
+          </p>
+        </div>
+      ) : health && health.fails > 0 ? (
+        <p className="text-[11px] text-warning border border-warning/40 bg-warning/5 rounded-xl px-3 py-2">
+          ⚠ 出站代理最近连续失败 {health.fails} 次
+          {health.lastFailAt ? `(最后一次 ${new Date(health.lastFailAt).toLocaleTimeString("zh-CN")})` : ""},
+          还没到停任务的阈值。再连着失败下去,这个账户的抢购任务就会被暂停 —— 现在去编辑里点一下「测试出口 IP」看代理还通不通。
+        </p>
+      ) : healthUnknown && acc.proxyUrl ? (
+        <p className="text-[11px] text-muted-foreground">
+          代理健康状态未问到,这里没有告警不代表代理正常。
+        </p>
+      ) : null}
 
       {subsidiaryWarning && (
         <p className="text-[11px] text-warning border border-warning/40 bg-warning/5 rounded-xl px-3 py-2">
@@ -677,10 +826,123 @@ function AccountCard({ acc, onEdit }: { acc: OVHAccount; onEdit: () => void }) {
   );
 }
 
+/**
+ * 代理地址的前置校验,规则跟后端 netfp.ValidateProxyURL 一致(协议 + 主机 + 端口)。
+ * 后端才是权威,这里只是让用户在按保存之前就看见错在哪 ——
+ * 代理写错的代价不是一句报错,是这个账户在补货那一刻一单都下不出去。
+ */
+function proxyInputError(raw: string): string {
+  const v = raw.trim();
+  if (!v) return "";
+  let u: URL;
+  try {
+    u = new URL(v);
+  } catch {
+    return "解析不了。格式:socks5://用户名:密码@主机:端口";
+  }
+  const scheme = u.protocol.replace(":", "").toLowerCase();
+  if (!["http", "https", "socks5", "socks5h"].includes(scheme)) {
+    return `不支持的协议 ${scheme}:只支持 http / https / socks5 / socks5h`;
+  }
+  if (!u.hostname) return "缺少主机名";
+  if (!u.port) return "缺少端口 —— 必须显式写出来,例如 :1080";
+  return "";
+}
+
+/**
+ * 出口 IP 测试结果面板。
+ *
+ * 这是用户唯一能确认"隔离真的生效"的手段,所以 IP 要显眼到能一眼跟另一个账户比对。
+ * 三种状态必须分开:请求没发出去(我们没问到)、测了但失败(出口断了)、测到了。
+ */
+function EgressPanel({
+  record,
+  pending,
+  requestError,
+  onRetry,
+  expectProxy,
+}: {
+  record?: ProxyTestRecord | null;
+  pending: boolean;
+  /** mutation 本身失败(网络/后端 500)—— 跟"代理不通"是两回事 */
+  requestError?: unknown;
+  onRetry: () => void;
+  /** 已保存的配置里到底有没有代理,用来识别"配了代理却没生效" */
+  expectProxy: boolean;
+}) {
+  if (pending) return <Skeleton className="h-24 rounded-2xl" />;
+  if (requestError) {
+    return (
+      <LoadFailedBanner
+        title="出口测试请求没发出去(这不代表代理有问题)"
+        error={requestError}
+        onRetry={onRetry}
+      />
+    );
+  }
+  if (!record) return null;
+  const at = new Date(record.testedAt).toLocaleString("zh-CN");
+
+  if (!record.success) {
+    return (
+      <div className="rounded-xl border border-destructive/40 bg-destructive/5 px-3 py-2.5 space-y-1 text-[11px]">
+        <p className="font-semibold text-destructive flex items-center gap-1.5">
+          <AlertTriangle className="w-3.5 h-3.5" />
+          出口测试失败 · 经由{record.via}
+        </p>
+        <p className="text-muted-foreground break-all">{record.error}</p>
+        <p className="text-muted-foreground">
+          {record.usingProxy
+            ? "配了代理就不会退回直连 —— 这条失败等于该账户此刻一单也下不出去。修好代理,或者改回直连。"
+            : "直连都失败,说明是这台机器本身出不去网,跟代理无关。"}
+        </p>
+        <p className="text-muted-foreground/70">{at} 测</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-xl border border-success/40 bg-success/5 px-3 py-2.5 space-y-1.5">
+      <p className="text-[11px] text-muted-foreground">这个账户实际用的出口 IP</p>
+      <p className="text-2xl font-mono font-semibold tracking-tight break-all">{record.egressIP}</p>
+      <p className="text-[11px] text-muted-foreground">
+        经由 {record.usingProxy ? <span className="font-mono">{record.proxy || "代理"}</span> : "直连"}
+        {" · "}指纹 {record.fingerprint}
+        {" · "}{at} 测
+      </p>
+      {expectProxy && !record.usingProxy && (
+        <p className="text-[11px] text-destructive border border-destructive/40 bg-destructive/5 rounded-lg px-2 py-1.5">
+          这个账户配了代理,但后端这次是按<b>直连</b>发出去的 —— 上面这个 IP 是本机出口,代理没保存上。
+          回到上面重新填一次代理再保存。
+        </p>
+      )}
+      {!record.usingProxy && !expectProxy && (
+        <p className="text-[11px] text-muted-foreground">
+          这是直连出口:所有没配代理的账户都是这个 IP,OVH 会把它们算作同一个来源。
+        </p>
+      )}
+      {record.warning && <p className="text-[11px] text-warning">⚠ {record.warning}</p>}
+      <p className="text-[11px] text-muted-foreground">
+        拿它跟别的账户比一比:两个账户测出同一个 IP,就说明隔离没生效。
+      </p>
+    </div>
+  );
+}
+
 function AccountDialog({ acc, onClose }: { acc?: OVHAccount; onClose: () => void }) {
   const create = useCreateAccount();
   const update = useUpdateAccount();
+  const test = useProxyTest();
+  // 指纹下拉的选项来源(以及整站共用的代理健康查询,key 相同不会多发请求)
+  const proxyStatus = useProxyStatus();
   const isEdit = !!acc;
+
+  // 已经落库的那份出站配置。「测试出口 IP」打的是**已保存**的配置,
+  // 所以必须拿得到 id 和保存后的值 —— 新建的账户保存成功后这里才会被填上。
+  const [saved, setSaved] = useState<{ id: string; proxyUrl: string; fingerprint: string } | null>(
+    acc ? { id: acc.id, proxyUrl: acc.proxyUrl || "", fingerprint: acc.fingerprint || "default" } : null
+  );
+
   // 编辑时三个凭据一律留空。后端不再下发明文（只给掩码），
   // 留空 = 保持原值（UpdateAccount 本来就是这个语义）。
   // 以前这里回填明文，等价于让 GET /api/accounts 必须吐出可用的凭据 ——
@@ -691,16 +953,50 @@ function AccountDialog({ acc, onClose }: { acc?: OVHAccount; onClose: () => void
     appSecret: "",
     consumerKey: "",
     zone: acc?.zone || "IE",
+    // 代理地址同理,也**不预填**:GET 回来的是打过码的(密码变 ***),
+    // 原样提交会把 *** 存成密码,下次抢购就连不上代理了。
+    proxyUrl: "",
+    fingerprint: acc?.fingerprint || "default",
   });
+  // 「改回直连」标记。清代理只能靠显式提交空串(后端:不传 = 不改,"" = 清掉),
+  // 而输入框留空是"保持不变" —— 没有这个开关,代理一旦配上就再也摘不掉了。
+  const [clearProxy, setClearProxy] = useState(false);
   const set = (k: keyof typeof form, v: string) => setForm((p) => ({ ...p, [k]: v }));
-  // 新建时三个凭据必填；编辑时可以全留空（只改名字/区域）
-  const canSubmit = isEdit
-    ? !!form.name.trim()
-    : form.name.trim() && form.appKey.trim() && form.appSecret.trim() && form.consumerKey.trim();
 
-  const submit = async () => {
-    if (!canSubmit) return;
-    const payload = {
+  const lastTest = useLastProxyTest(saved?.id || "").data;
+  const proxyErr = clearProxy ? "" : proxyInputError(form.proxyUrl);
+  // 新建时三个凭据必填；编辑时可以全留空（只改名字/区域/出站配置）
+  const canSubmit =
+    !proxyErr &&
+    (saved
+      ? !!form.name.trim()
+      : !!(form.name.trim() && form.appKey.trim() && form.appSecret.trim() && form.consumerKey.trim()));
+
+  // 出站配置改了但还没保存。proxy-test 打的是已保存的配置,
+  // 这种时候测出来的是旧出口 —— 让用户对着旧结果判断新配置是最坏的一种误导。
+  const outboundDirty = clearProxy || !!form.proxyUrl.trim() || form.fingerprint !== (saved?.fingerprint || "default");
+
+  const profiles = proxyStatus.data?.profiles || [];
+  // 可选项只认后端给的清单,前端不写死:写死的清单迟早跟后端对不上,
+  // 用户选了个后端不认的名字,后端会退回 default,而界面上还显示着他选的那个。
+  // 再并上"这个账户当前存着的值" —— 清单里没有它的话,Radix 找不到匹配项会显示成
+  // placeholder,等于把库里真实存着的配置从界面上抹掉。
+  const fpOptions = Array.from(
+    new Set([...profiles, form.fingerprint, saved?.fingerprint || "default"].filter(Boolean))
+  );
+  // 清单没问到时锁住:此刻我们并不知道后端认哪些名字,让用户在一份自己编的清单里选是骗他
+  const fpLocked = profiles.length === 0;
+
+  // 保存成功后把基准换成后端回来的那份:输入框回到"留空 = 不变",清除标记撤掉。
+  // 不这么做的话刚保存完界面仍算"有未保存的改动",测试按钮会一直是禁用的。
+  const applySaved = (a: OVHAccount) => {
+    setSaved({ id: a.id, proxyUrl: a.proxyUrl || "", fingerprint: a.fingerprint || "default" });
+    setForm((p) => ({ ...p, proxyUrl: "", fingerprint: a.fingerprint || "default" }));
+    setClearProxy(false);
+  };
+
+  const buildPayload = (): Partial<AccountInput> => {
+    const payload: Partial<AccountInput> = {
       name: form.name.trim(),
       // 留空的凭据不发 —— 后端见空即保持原值
       appKey: form.appKey.trim(),
@@ -709,13 +1005,60 @@ function AccountDialog({ acc, onClose }: { acc?: OVHAccount; onClose: () => void
       zone: form.zone,
       endpoint: endpointForZone(form.zone),
     };
-    if (isEdit) {
-      await update.mutateAsync({ id: acc!.id, input: payload });
-    } else {
-      await create.mutateAsync(payload);
+    if (!saved) {
+      // 新建:所填即所得,空 = 直连
+      payload.proxyUrl = clearProxy ? "" : form.proxyUrl.trim();
+      payload.fingerprint = form.fingerprint;
+      return payload;
     }
-    onClose();
+    // 编辑:指针语义。空串只在用户明确点了「改回直连」时才发,
+    // 输入框留空则整个 key 都不传 —— 否则会把已配好的代理悄悄清掉。
+    if (clearProxy) {
+      payload.proxyUrl = "";
+    } else if (form.proxyUrl.trim()) {
+      payload.proxyUrl = form.proxyUrl.trim();
+    }
+    if (form.fingerprint !== saved.fingerprint) {
+      payload.fingerprint = form.fingerprint;
+    }
+    return payload;
   };
+
+  /** 保存,返回账户 ID(失败返回 null,错误提示由 hooks 里的 toast 负责) */
+  const save = async (): Promise<string | null> => {
+    if (!canSubmit) return null;
+    const payload = buildPayload();
+    if (saved) {
+      const res = await update.mutateAsync({ id: saved.id, input: payload });
+      applySaved(res.account);
+      return saved.id;
+    }
+    const res = await create.mutateAsync(payload as AccountInput);
+    applySaved(res.account);
+    return res.account.id;
+  };
+
+  const submit = async () => {
+    try {
+      const id = await save();
+      if (id) onClose();
+    } catch {
+      // useCreateAccount / useUpdateAccount 的 onError 已经弹过 toast
+    }
+  };
+
+  // 保存 → 立刻用刚落库的配置测出口,并且**不关对话框**:
+  // 用户的动作就是"我刚填完这个代理,当场看看通不通、出口是不是我要的那个"。
+  const saveAndTest = async () => {
+    try {
+      const id = await save();
+      if (id) await test.mutateAsync(id);
+    } catch {
+      // 同上,toast 已经提示过
+    }
+  };
+
+  const busy = create.isPending || update.isPending || test.isPending;
 
   return (
     <Dialog open onOpenChange={(v) => !v && onClose()}>
@@ -724,7 +1067,7 @@ function AccountDialog({ acc, onClose }: { acc?: OVHAccount; onClose: () => void
           <DialogTitle>{isEdit ? `编辑账户 ${acc!.name}` : "添加 OVH 账户"}</DialogTitle>
           <DialogDescription>填三个 OVH 密钥 + 选子公司,保存时会自动调 /me 验证凭据。</DialogDescription>
         </DialogHeader>
-        <div className="space-y-4 py-2">
+        <div className="space-y-4 py-2 max-h-[65vh] overflow-y-auto -mx-6 px-6">
           <Field label="账户名称 *">
             <Input value={form.name} onChange={(e) => set("name", e.target.value)} placeholder="主号 / 小号 A" autoFocus />
             {isEdit && (
@@ -762,6 +1105,154 @@ function AccountDialog({ acc, onClose }: { acc?: OVHAccount; onClose: () => void
             </Select>
           </Field>
 
+          {/* ── 出站配置 ───────────────────────────────────────────────── */}
+          <div className="border-t border-border pt-4 space-y-4">
+            <div>
+              <p className="text-[13px] font-semibold flex items-center gap-1.5">
+                <Network className="w-3.5 h-3.5" />
+                出站代理与指纹
+              </p>
+              <p className="text-[11px] text-muted-foreground mt-1 leading-relaxed">
+                OVH 的限流按来源 IP 算,几个账户共用一个出口时会互相拖累,而这恰好发生在补货那一刻。
+                给这个账户配一个自己的出口,它就不会被别的账户连累。
+              </p>
+            </div>
+
+            <Field label="出站代理地址">
+              <Input
+                value={form.proxyUrl}
+                onChange={(e) => set("proxyUrl", e.target.value)}
+                disabled={clearProxy}
+                placeholder={
+                  clearProxy
+                    ? "已标记改回直连"
+                    : saved
+                      ? "留空 = 保持不变"
+                      : "socks5://user:pass@1.2.3.4:1080(留空 = 直连)"
+                }
+                className="font-mono"
+              />
+              {proxyErr && <p className="text-[11px] text-destructive mt-1">代理地址不合法:{proxyErr}</p>}
+
+              {/* 已落库的账户:回显的是打过码的地址,绝不能预填进输入框;清代理要有明确动作 */}
+              {saved && (
+                <div className="mt-2 space-y-1.5">
+                  <p className="text-[11px] text-muted-foreground">
+                    当前:
+                    {saved?.proxyUrl ? (
+                      <code className="ml-1 font-mono">{saved.proxyUrl}</code>
+                    ) : (
+                      <span className="ml-1">直连(没配代理)</span>
+                    )}
+                    {saved?.proxyUrl ? "(密码已打码,所以这里不预填 —— 把 *** 原样提交会把它存成真密码)" : ""}
+                  </p>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-[11px] text-muted-foreground">留空 = 保持不变;要摘掉代理:</span>
+                    {clearProxy ? (
+                      <Button variant="outline" size="sm" onClick={() => setClearProxy(false)}>
+                        撤销「改回直连」
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={!saved?.proxyUrl}
+                        onClick={() => {
+                          setClearProxy(true);
+                          set("proxyUrl", "");
+                        }}
+                      >
+                        <Ban className="w-3.5 h-3.5" />
+                        改回直连
+                      </Button>
+                    )}
+                  </div>
+                  {clearProxy && (
+                    <p className="text-[11px] text-warning">
+                      保存后这个账户会清掉代理、改成直连出口 —— 它将和其它直连账户共用同一个出口 IP。
+                    </p>
+                  )}
+                </div>
+              )}
+
+              <div className="mt-2 space-y-1 text-[11px] leading-relaxed">
+                <p className="text-muted-foreground">
+                  支持 <code className="font-mono">http://</code> <code className="font-mono">https://</code>{" "}
+                  <code className="font-mono">socks5://</code> <code className="font-mono">socks5h://</code>,
+                  <b>必须带端口</b>(例如 <code className="font-mono">socks5://user:pass@1.2.3.4:1080</code>)。
+                  {saved ? "留空 = 保持不变(要摘掉代理用上面的「改回直连」)。" : "留空 = 直连。"}
+                </p>
+                <p className="text-warning">
+                  代理配错或连不上时<b>不会</b>退回直连,该账户的请求直接失败;连续失败到阈值后,后端会
+                  <b>暂停这个账户的抢购任务</b>并关掉订阅的自动下单(修好也不自动恢复)。
+                  这是故意的 —— 悄悄直连的表现是一切正常、隔离却已经没了。
+                </p>
+              </div>
+            </Field>
+
+            {/* 测试出口:就放在代理输入框下面,填完当场点一下 */}
+            <div className="space-y-2">
+              <div className="flex items-center gap-2 flex-wrap">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => saved && test.mutate(saved.id)}
+                  disabled={!saved || outboundDirty || busy}
+                >
+                  <Radar className={cn("w-3.5 h-3.5", test.isPending && "animate-pulse")} />
+                  {test.isPending ? "测试中…" : "测试出口 IP"}
+                </Button>
+                <span className="text-[11px] text-muted-foreground">
+                  {!saved
+                    ? "新账户要先保存才能测 —— 测的是已保存的配置。用下面的「保存并测试出口」一步到位。"
+                    : outboundDirty
+                      ? "上面的代理/指纹改了还没保存,现在测到的是旧配置的出口 —— 用下面的「保存并测试出口」。"
+                      : "测的是这个账户已保存的配置,走的和真实下单同一条出站链路。"}
+                </span>
+              </div>
+              <EgressPanel
+                record={lastTest}
+                pending={test.isPending}
+                requestError={test.isError ? test.error : undefined}
+                onRetry={() => saved && test.mutate(saved.id)}
+                expectProxy={!!saved?.proxyUrl}
+              />
+            </div>
+
+            <Field label="出站指纹">
+              <Select value={form.fingerprint} onValueChange={(v) => set("fingerprint", v)} disabled={fpLocked}>
+                <SelectTrigger><SelectValue placeholder="default" /></SelectTrigger>
+                <SelectContent>
+                  {fpOptions.map((p) => (
+                    <SelectItem key={p} value={p}>
+                      {p}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {/* 选项拉不到就锁住:此刻我们不知道后端认哪些名字,瞎给一份清单只会让用户选到一个
+                  后端不认、会被退回 default 的值 —— 而界面上还显示着他选的那个。 */}
+              {proxyStatus.isError && (
+                <div className="mt-2">
+                  <LoadFailedBanner
+                    title="指纹配置清单读取失败 —— 暂时只能保持原值"
+                    error={proxyStatus.error}
+                    onRetry={() => proxyStatus.refetch()}
+                  />
+                </div>
+              )}
+              {proxyStatus.isPending && (
+                <p className="text-[11px] text-muted-foreground mt-1">正在读可选的指纹配置…</p>
+              )}
+              <p className="text-[11px] text-muted-foreground mt-2 leading-relaxed">
+                <b>这不是完整的浏览器指纹模拟。</b>Go 标准库不允许控制 JA3 的主要构成要素
+                (套件顺序被忽略、TLS 1.3 套件不可配、扩展顺序固定),所以这个选项改的只是
+                TLS 版本区间、ALPN / 是否走 h2、User-Agent 这类。选 <code className="font-mono">chrome-like</code>{" "}
+                <b>不等于</b> Chrome 的 JA3 —— 要做到那个得换 uTLS 重写握手,这里做不到。
+              </p>
+            </Field>
+          </div>
+
           {/* 申请密钥的说明放在这里而不是只放首次进入的弹窗:
               日常加号 / 换号都走这个对话框,而"去哪申请、申请错站点会怎样"恰恰是
               这时候最容易踩的坑。链接必须跟着上面选的子公司走 —— 三站的 token 互不通用。 */}
@@ -788,9 +1279,14 @@ function AccountDialog({ acc, onClose }: { acc?: OVHAccount; onClose: () => void
             </p>
           </div>
         </div>
-        <DialogFooter>
+        {/* 三个按钮在窄屏上要能换行,否则「保存并验证」会被挤出对话框 */}
+        <DialogFooter className="flex-wrap gap-2 space-x-0">
           <Button variant="outline" onClick={onClose}>取消</Button>
-          <Button onClick={submit} disabled={!canSubmit || create.isPending || update.isPending}>
+          <Button variant="outline" onClick={saveAndTest} disabled={!canSubmit || busy}>
+            <Radar className="w-3.5 h-3.5" />
+            {busy ? "处理中…" : "保存并测试出口"}
+          </Button>
+          <Button onClick={submit} disabled={!canSubmit || busy}>
             {(create.isPending || update.isPending) ? "保存中…" : "保存并验证"}
           </Button>
         </DialogFooter>

@@ -61,6 +61,24 @@ type OVHAccount struct {
 	IAM         string `json:"iam"`       // go-ovh-<zone-lower>
 	IsDefault   bool   `json:"isDefault"` // 默认账户（未指定时 fallback 用它）
 	CreatedAt   string `json:"createdAt"`
+
+	// ProxyURL 这个账户的出站代理。空 = 直连。
+	//
+	//	http://user:pass@host:port
+	//	socks5://user:pass@host:port
+	//
+	// 为什么要按账户隔离出口:OVH 的限流是按来源 IP 算的,多个账户共用一个出口时
+	// 一个账户被限流会把其它账户一起拖下水 —— 而这恰好发生在补货那一刻。
+	//
+	// 带凭据,所以和 AppSecret 一样加密落盘;GetAccounts 回前端时打码。
+	ProxyURL string `json:"proxyUrl,omitempty"`
+
+	// Fingerprint 出站指纹配置名(见 internal/netfp.Profiles)。空 = default。
+	//
+	// 注意它能做到的程度有限:Go 标准库不允许控制 JA3 的主要构成要素
+	// (套件顺序被忽略、TLS 1.3 套件不可配、扩展顺序固定),
+	// 所以这里改的是 TLS 版本区间、ALPN/h2、以及 UA 这类头。详见 netfp 包的说明。
+	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
 // QueueItem 抢购队列项
