@@ -38,6 +38,23 @@ func main() {
 	// 所以路径必须和 Load() 用的完全一致 —— 分叉了就会出现
 	// "写进了 A、下次从 B 读"的情况,而那意味着重新生成一把新密钥。
 	envPath := envFilePath()
+	// 空值的环境变量要当成"没设"。
+	//
+	// godotenv.Load 不覆盖**已存在**的环境变量 —— 哪怕它是空串。
+	// 而容器编排很容易设出空变量:docker compose 里写
+	// `OVH_DB_KEY: ${OVH_DB_KEY:-}`,宿主机没定义时容器里就是一个空的 OVH_DB_KEY。
+	//
+	// 后果是灾难性的且完全无声:文件里明明有密钥,却因为环境变量"已存在"而读不进来,
+	// 于是每次启动都判定"没有密钥"、重新生成一把、再追加进 .env ——
+	// 之前加密的 OVH 凭据和 Telegram Token 从此永久解不开,
+	// 而用户看到的只是"账户怎么没了"。
+	//
+	// 实测踩到过:容器重启两次,/data/.env 里就有两行 OVH_DB_KEY。
+	clearEmptyEnv(
+		"OVH_DB_KEY", "API_SECRET_KEY", "TG_ALLOWED_USER_IDS",
+		"CORS_ALLOWED_ORIGINS", "TRUSTED_PROXIES", "OVH_UPDATE_API",
+		"LISTEN_HOST", "PORT", "DATA_DIR", "CACHE_DIR", "LOGS_DIR",
+	)
 	_ = godotenv.Load(envPath)
 
 	level := slog.LevelInfo
@@ -801,5 +818,18 @@ func applySharedProxy(state *app.State) {
 	}
 	if p := netfp.SharedProxy(); p != "" {
 		state.Logger.Info("公开目录/区域探测统一走: "+p, "proxy")
+	}
+}
+
+// clearEmptyEnv 把"设了但是空串"的环境变量彻底 unset。
+//
+// 只有 unset 之后 godotenv 才会用配置文件里的值填上 ——
+// 它对已存在的变量一律跳过，不看是不是空的。
+// 容器编排（compose 的 ${VAR:-}、k8s 的空 value）很容易设出这种变量。
+func clearEmptyEnv(names ...string) {
+	for _, n := range names {
+		if v, ok := os.LookupEnv(n); ok && strings.TrimSpace(v) == "" {
+			_ = os.Unsetenv(n)
+		}
 	}
 }

@@ -35,15 +35,22 @@ services:
 
       # 数据库加密密钥。留空会自动生成并写进 ./data/.env（跟着卷走，不会丢）。
       # 显式提供的好处是换机器/迁移/k8s secret 时更可控。
-      OVH_DB_KEY: ${OVH_DB_KEY:-}
+      #
+      # ⚠️ 下面这几个写成 `KEY:`（没有值）而不是 `KEY: ${KEY:-}`，是有原因的：
+      # 后者在宿主机没定义时会往容器里塞一个**空但已设置**的变量，
+      # 而空变量和"没设"对很多程序是两回事。
+      # OVH_DB_KEY 上踩过一次：空变量会让程序读不到 .env 里的真密钥，
+      # 于是每次启动重新生成一把 —— 之前加密的凭据永久解不开。
+      # 写成 `KEY:` 时 compose 只在宿主机真的定义了它时才传进去。
+      OVH_DB_KEY:
 
       TZ: ${TZ:-Asia/Shanghai}
       # 容器内文件的属主。想和宿主机当前用户对齐就填 id -u / id -g
       PUID: ${PUID:-10001}
       PGID: ${PGID:-10001}
-      # 放在反代后面时按需设置
-      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
-      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      # 放在反代后面时按需设置（同样写成不带值的形式）
+      CORS_ALLOWED_ORIGINS:
+      TRUSTED_PROXIES:
 
     # 日志轮转。
     #
