@@ -258,6 +258,8 @@ func main() {
 
 		// 按账户的出站代理:查真实出口 IP(确认隔离生效的唯一可靠手段)+ 健康状况
 		api.POST("/accounts/:id/proxy-test", handlers.TestAccountProxy(state))
+		// 出站链路体检:出口 IP + 各目标连通性与延迟(抢购对延迟直接敏感)
+		api.POST("/accounts/:id/proxy-check", handlers.CheckAccountProxy(state))
 		api.GET("/accounts/proxy-status", handlers.ProxyStatus(state))
 
 		// Servers / availability / cache

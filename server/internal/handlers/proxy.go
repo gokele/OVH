@@ -3,11 +3,13 @@ package handlers
 import (
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/ovh-buy/server/internal/app"
 	"github.com/ovh-buy/server/internal/netfp"
+	"github.com/ovh-buy/server/internal/ovh"
 	"github.com/ovh-buy/server/internal/proxyguard"
 )
 
@@ -113,4 +115,75 @@ func RefreshSharedProxy(state *app.State) {
 	if err := netfp.SetSharedProxy(acc.ProxyURL); err != nil {
 		state.Logger.Warn("公开请求的统一出口设置失败,将走直连: "+err.Error(), "proxy")
 	}
+}
+
+// CheckAccountProxy POST /api/accounts/:id/proxy-check
+//
+// 这个账户的出站链路体检：出口 IP + 各目标的连通性与延迟。
+//
+// 为什么延迟要单独测、还要采样多次：
+// 抢购是抢时间的。1400ms 的代理和 300ms 的代理，在补货那一刻是两种结果。
+// 而且单次采样噪声很大 —— min 和 avg 差得远说明抖动大，
+// 抖动大的代理会不定时地慢一拍，那一拍就决定抢不抢得到。
+//
+// 目标只列这个账户**真正会打**的那个大区：账户只和自己那一个站点说话，
+// 把另外两个也列出来是噪音，还会让人误以为"另外两个红了有问题"。
+func CheckAccountProxy(state *app.State) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id := c.Param("id")
+		acc, ok := state.FindAccount(id)
+		if !ok {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "账户不存在"})
+			return
+		}
+		prof, warn := netfp.LookupProfile(acc.Fingerprint)
+		opts := netfp.Options{ProxyURL: acc.ProxyURL, Profile: prof, Timeout: 10 * time.Second}
+
+		region := ovh.EndpointRegion(acc.Endpoint)
+		base := ovh.APIBaseURLForRegion(region)
+		targets := []netfp.ProbeSpec{
+			// auth/time 不需要凭据，是这个站点最轻的一个端点 ——
+			// 它测的正是下单时真正要打的那台主机
+			{Name: apiHostOf(base) + "（下单/控制台）", URL: base + "/1.0/auth/time"},
+			// 库存可用性是每 5 秒一次的热路径，延迟直接决定能不能抢到
+			{Name: apiHostOf(base) + "（库存查询）",
+				URL: base + "/1.0/dedicated/server/datacenter/availabilities?planCode=24sk602"},
+		}
+
+		probes := netfp.ProbeAll(opts, targets)
+
+		// 出口 IP 单独查：它是"隔离到底生效没有"的唯一凭据
+		egress, egErr := netfp.EgressIP(opts)
+
+		usingProxy := strings.TrimSpace(acc.ProxyURL) != ""
+		out := gin.H{
+			"success":     true,
+			"accountId":   acc.ID,
+			"accountName": acc.Name,
+			"region":      region,
+			"usingProxy":  usingProxy,
+			"proxy":       netfp.ScrubProxyURL(acc.ProxyURL),
+			"fingerprint": prof.Name,
+			"targets":     probes,
+			"checkedAt":   time.Now().Format(time.RFC3339),
+		}
+		if egErr != nil {
+			out["egressError"] = egErr.Error()
+		} else {
+			out["egressIP"] = egress
+		}
+		if warn != "" {
+			out["warning"] = warn
+		}
+		c.JSON(http.StatusOK, out)
+	}
+}
+
+// apiHostOf 从 base URL 里取主机名，给界面当标题用。
+func apiHostOf(base string) string {
+	s := strings.TrimPrefix(strings.TrimPrefix(base, "https://"), "http://")
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	return s
 }

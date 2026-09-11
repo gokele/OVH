@@ -121,6 +121,9 @@ export function useUpdateAccount() {
       // 留着它等于拿旧 IP 冒充新配置的结果 —— 而这个 IP 正是用户用来判断
       // "隔离到底生没生效"的唯一依据,宁可空着让他重测一次。
       qc.removeQueries({ queryKey: qk.accounts.proxyTest(vars.id) });
+      // 链路检测同理:那份延迟数字是旧代理跑出来的,留着会让用户拿旧链路的成绩
+      // 给新代理背书 —— 而他改代理的目的往往正是嫌慢。
+      qc.removeQueries({ queryKey: qk.accounts.proxyCheck(vars.id) });
       toast.success("账户已更新");
       if (!data.valid) {
         toast.warning("账户已保存,但 OVH 验证失败,请检查凭据");
@@ -142,6 +145,7 @@ export function useDeleteAccount() {
       qc.invalidateQueries({ queryKey: ACCOUNTS_KEY });
       qc.invalidateQueries({ queryKey: qk.accounts.proxyStatus() });
       qc.removeQueries({ queryKey: qk.accounts.proxyTest(id) });
+      qc.removeQueries({ queryKey: qk.accounts.proxyCheck(id) });
       // 关联数据也变了,顺手 invalidate
       qc.invalidateQueries({ queryKey: ["queue"] });
       qc.invalidateQueries({ queryKey: ["history"] });
@@ -333,5 +337,173 @@ export function useLastProxyTests(accountIds: string[]) {
       enabled: false,
       staleTime: Infinity,
     })),
+  });
+}
+
+// ─── 出站链路检测 ──────────────────────────────────────────────────────────
+
+/**
+ * 一个探测目标的检测结果。
+ *
+ * ok 的判据是**拿到了任何 HTTP 响应**,不是拿到 200(后端 netfp.ProbeTarget 就是这么判的):
+ * 404 / 302 只说明那个路径不存在或要跳转,链路本身是通的。
+ *
+ * 反过来,ok 为 true 时 error 也可能非空 —— 那是 3 次采样里失败的那几次。
+ * 既不是"通了"也不是"不通",是这条链路会偶发抽风,必须单独说出来。
+ */
+export interface ProxyProbeTarget {
+  name: string;
+  url: string;
+  ok: boolean;
+  /** 拿到的 HTTP 状态码 */
+  status?: number;
+  /** 3 次采样的最小 / 平均耗时(毫秒) */
+  minMs?: number;
+  avgMs?: number;
+  error?: string;
+}
+
+/** 检测跑完了。注意这不代表每个目标都通 —— 每个目标的成败各看自己的 ok */
+export interface ProxyCheckSuccess {
+  success: true;
+  accountId: string;
+  accountName: string;
+  /** 这个账户真正会打的那个大区(EU / US / CA),后端按 endpoint 推 */
+  region: string;
+  usingProxy: boolean;
+  /** 打过码的代理地址,直连时为空 */
+  proxy: string;
+  fingerprint: string;
+  egressIP?: string;
+  /** 查不到出口 IP 的原因。它和 egressIP 只会出现一个 */
+  egressError?: string;
+  /** 后端测完的时刻(RFC3339) */
+  checkedAt: string;
+  /** 例如指纹名不认识、已按 default 处理 */
+  warning?: string;
+  targets: ProxyProbeTarget[];
+}
+
+/** 检测没做成(账户不存在之类)。后端这种情况也回 200,只是 success=false */
+export interface ProxyCheckFailure {
+  success: false;
+  error: string;
+}
+
+export type ProxyCheckResult = ProxyCheckSuccess | ProxyCheckFailure;
+
+/** 缓存里存的那一份:多记一个收到的时刻,免得几小时前的结果被当成刚测出来的 */
+export type ProxyCheckRecord =
+  | (ProxyCheckSuccess & { receivedAt: number })
+  | (ProxyCheckFailure & { receivedAt: number });
+
+/** 这份结果是什么时候的:后端给的检测时刻优先,没有(检测本身失败)就用收到的时刻 */
+export function proxyCheckTime(rec: ProxyCheckRecord): Date {
+  if (rec.success && rec.checkedAt) {
+    const d = new Date(rec.checkedAt);
+    if (!isNaN(d.getTime())) return d;
+  }
+  return new Date(rec.receivedAt);
+}
+
+/** 延迟档位。抢购对延迟直接敏感,数字必须配一句结论 —— 只给数字用户没法判断该不该换代理 */
+export type LatencyLevel = "fast" | "slow" | "bad";
+
+/**
+ * 按最小耗时分档。
+ *
+ * 用 min 不用 avg:min 是这条链路的**最好情况**。连最好情况都超过 800ms,
+ * 补货那一刻就没什么指望了 —— 别人 200ms 打完三个来回,这边第一个请求还在路上。
+ */
+export function gradeLatency(minMs: number): { level: LatencyLevel; note: string } {
+  if (minMs < 300) {
+    return { level: "fast", note: "延迟正常,补货那一刻不会因为链路吃亏。" };
+  }
+  if (minMs <= 800) {
+    return { level: "slow", note: "偏慢。冷门机型够用,热门机型会比别人慢半步。" };
+  }
+  return {
+    level: "bad",
+    note: "这个延迟在补货那一刻很可能抢不过别人 —— 换一个离该大区更近的代理。",
+  };
+}
+
+/**
+ * 抖动:平均比最小大一倍以上。
+ *
+ * 这条比平均值本身更要紧 —— 抖动大的链路平时看着挺快,会不定时地慢一拍,
+ * 而那一拍就决定抢不抢得到。
+ */
+export function isJittery(t: ProxyProbeTarget): boolean {
+  return !!(t.ok && t.minMs && t.avgMs && t.avgMs > t.minMs * 2);
+}
+
+/**
+ * 一次检测里最慢的那条(只看通了的)。
+ * 一条都没通就是 undefined —— 那是"不通",跟"慢"是两回事,不能混成一个结论。
+ */
+export function worstMinMs(targets: ProxyProbeTarget[]): number | undefined {
+  const xs = targets
+    .filter((t) => t.ok && typeof t.minMs === "number")
+    .map((t) => t.minMs as number);
+  return xs.length ? Math.max(...xs) : undefined;
+}
+
+/**
+ * 给一个账户做一次出站链路体检:出口 IP + 到 OVH 各目标的连通性与延迟。
+ *
+ * 跟「测试出口 IP」不是一回事:那个只回答"我从哪个 IP 出去",
+ * 这个回答"从这个账户打到 OVH 要多久" —— 抢购的输赢就在这几百毫秒上。
+ * 每个目标真打 3 次,所以要几秒,界面上必须看得出在跑。
+ *
+ * 同样注意后端对"检测没做成"也回 200(body 里 success=false):
+ * 落进 mutation 的成功分支只代表请求通了,业务成败一律看 data.success。
+ */
+export function useProxyCheck() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      (await api.post<ProxyCheckResult>(`/accounts/${id}/proxy-check`)).data,
+    onSuccess: (data, id) => {
+      const rec: ProxyCheckRecord = { ...data, receivedAt: Date.now() };
+      qc.setQueryData(qk.accounts.proxyCheck(id), rec);
+      if (!data.success) {
+        toast.error(`链路检测没做成: ${data.error}`);
+        return;
+      }
+      if (data.warning) toast.warning(data.warning, { duration: 10000 });
+      const down = data.targets.filter((t) => !t.ok);
+      if (down.length > 0) {
+        // 目标不通 ≠ 慢,这是"此刻下不了单",优先级高于任何延迟结论
+        toast.error(`${down.length}/${data.targets.length} 个目标不通 —— 这个账户现在下不出单`);
+        return;
+      }
+      const worst = worstMinMs(data.targets);
+      if (worst === undefined) {
+        toast.warning("检测回来了,但没有一条目标给出延迟 —— 打开弹窗看具体哪条");
+        return;
+      }
+      const g = gradeLatency(worst);
+      const head = `链路检测完成 · 最慢目标 ${worst}ms`;
+      if (g.level === "bad") toast.error(`${head} —— ${g.note}`, { duration: 10000 });
+      else if (g.level === "slow") toast.warning(`${head} —— ${g.note}`, { duration: 8000 });
+      else toast.success(head);
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error || "链路检测请求没发出去"),
+  });
+}
+
+/**
+ * 读某个账户最近一次的链路检测结果。
+ *
+ * 同 useLastProxyTest:永远不自己发请求(enabled: false),只是 useProxyCheck 写进缓存那份的读端。
+ * 检测要几秒、还会真的去打 OVH,所以关掉弹窗再打开显示的是上次那份 + 那次的时间,不自动重测。
+ */
+export function useLastProxyCheck(accountId: string) {
+  return useQuery<ProxyCheckRecord | null>({
+    queryKey: qk.accounts.proxyCheck(accountId),
+    queryFn: async () => null,
+    enabled: false,
+    staleTime: Infinity,
   });
 }

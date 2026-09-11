@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { Settings as SettingsIcon, KeyRound, Globe, Send, Database, Save, AlertTriangle, CheckCircle2, Plus, Star, RotateCw, Trash2, Pencil, BellRing, RefreshCw, Radio, Network, Fingerprint, ShieldAlert, Radar, Ban } from "lucide-react";
+import { Settings as SettingsIcon, KeyRound, Globe, Send, Database, Save, AlertTriangle, CheckCircle2, Plus, Star, RotateCw, Trash2, Pencil, BellRing, RefreshCw, Radio, Network, Fingerprint, ShieldAlert, Radar, Ban, Activity } from "lucide-react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { LoadFailed, LoadFailedBanner } from "@/components/common/LoadFailed";
@@ -10,6 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/common/Skeleton";
 import { Chip } from "@/components/common/Chip";
+import { StatusDot } from "@/components/common/StatusDot";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import {
   useSettings,
@@ -35,11 +36,19 @@ import {
   useProxyTest,
   useLastProxyTest,
   useLastProxyTests,
+  useProxyCheck,
+  useLastProxyCheck,
   accountChipColor,
+  gradeLatency,
+  isJittery,
+  worstMinMs,
+  proxyCheckTime,
   type OVHAccount,
   type AccountInput,
   type AccountProxyStatus,
   type ProxyTestRecord,
+  type ProxyProbeTarget,
+  type LatencyLevel,
 } from "@/hooks/use-accounts";
 
 /** 根据 zone 推 endpoint */
@@ -690,7 +699,11 @@ function AccountCard({
   const setDefault = useSetDefaultAccount();
   const del = useDeleteAccount();
   const verify = useVerifyAccount();
+  // 链路检测放在卡片这一层而不是弹窗里:它要跑几秒,用户中途关掉弹窗很正常。
+  // 放弹窗里一关就把 pending 状态弄丢了,回头再打开看起来像什么都没发生过。
+  const check = useProxyCheck();
   const [confirming, setConfirming] = useState(false);
+  const [checking, setChecking] = useState(false);
   // 最近一次出口测试(在编辑框里点的)。摆在卡片上是为了让几个账户的出口 IP 并排可比。
   const lastTest = useLastProxyTest(acc.id).data;
 
@@ -748,6 +761,16 @@ function AccountCard({
         </div>
       </div>
       <div className="flex items-center gap-2 flex-shrink-0">
+        {/* 凭据对不对、出口是哪个 IP,都不回答"这条链路快不快" —— 而抢购输赢就在这上面 */}
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => setChecking(true)}
+          title="实测这个账户到 OVH 的连通性与延迟"
+        >
+          <Activity className={cn("w-3.5 h-3.5", check.isPending && "animate-pulse")} />
+          {check.isPending ? "检测中…" : "链路检测"}
+        </Button>
         <Button variant="ghost" size="icon" onClick={() => verify.mutate(acc.id)} disabled={verify.isPending} title="重新验证凭据">
           <RotateCw className={cn("w-4 h-4", verify.isPending && "animate-spin")} />
         </Button>
@@ -798,6 +821,8 @@ function AccountCard({
         </p>
       )}
 
+      <LinkCheckDialog acc={acc} open={checking} onOpenChange={setChecking} check={check} />
+
       <Dialog open={confirming} onOpenChange={setConfirming}>
         <DialogContent className="w-[95vw] sm:w-full sm:max-w-md">
           <DialogHeader>
@@ -823,6 +848,310 @@ function AccountCard({
         </DialogContent>
       </Dialog>
     </div>
+  );
+}
+
+/** 延迟档位 → 文字颜色。数字光摆着没用,用户要的是"这个数字算好还是算差" */
+const latencyText: Record<LatencyLevel, string> = {
+  fast: "text-success",
+  slow: "text-warning",
+  bad: "text-destructive",
+};
+
+const latencyBox: Record<LatencyLevel, string> = {
+  fast: "border-success/40 bg-success/5",
+  slow: "border-warning/40 bg-warning/5",
+  bad: "border-destructive/40 bg-destructive/5",
+};
+
+const latencyLabel: Record<LatencyLevel, string> = {
+  fast: "正常",
+  slow: "偏慢",
+  bad: "太慢",
+};
+
+/**
+ * 一个探测目标一行:● 名称 …… 最小 XXXms / 平均 XXXms  HTTP 200
+ *
+ * 最小值按档位着色 —— 一屏里要能一眼扫出哪条链路拖后腿,而不是回头自己去比数字。
+ */
+function ProbeRow({ t }: { t: ProxyProbeTarget }) {
+  const g = t.ok && typeof t.minMs === "number" ? gradeLatency(t.minMs) : null;
+  return (
+    <div className="space-y-0.5">
+      <div className="flex items-center gap-2">
+        <StatusDot tone={t.ok ? "success" : "danger"} />
+        <span className="text-[12px] font-medium truncate" title={t.url}>
+          {t.name}
+        </span>
+        <span className="flex-1 min-w-[8px] border-b border-dashed border-border" />
+        {t.ok ? (
+          <span className="text-[11px] font-mono whitespace-nowrap">
+            最小 <b className={g ? latencyText[g.level] : undefined}>{t.minMs}ms</b>
+            <span className="text-muted-foreground"> / 平均 {t.avgMs}ms</span>
+          </span>
+        ) : (
+          <span className="text-[11px] text-destructive whitespace-nowrap">没拿到响应</span>
+        )}
+        {t.status ? (
+          <Chip className="whitespace-nowrap">HTTP {t.status}</Chip>
+        ) : null}
+      </div>
+      {!t.ok && t.error && <p className="pl-4 text-[11px] text-destructive break-all">{t.error}</p>}
+      {/* 通了却还带着 error:3 次采样里有失败的。既不是"通"也不是"不通",单独说清楚 */}
+      {t.ok && t.error && (
+        <p className="pl-4 text-[11px] text-warning break-all">
+          3 次采样里有失败的:{t.error} —— 这条链路会偶发抽风,补货那一刻正好撞上就没了。
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 出站链路体检弹窗。
+ *
+ * 「测试出口 IP」回答的是"我从哪个 IP 出去",这里回答"从这个账户打到 OVH 要多久" ——
+ * 出口对了不代表抢得到:1400ms 的代理和 300ms 的代理,在补货那一刻是两种结果。
+ *
+ * 打开不自动开测:检测会真的去打 OVH、要几秒。上一次的结果留在 query 缓存里,
+ * 关掉再打开看到的是那一份 + 那一次的时间,要新的就自己点重测。
+ */
+function LinkCheckDialog({
+  acc,
+  open,
+  onOpenChange,
+  check,
+}: {
+  acc: OVHAccount;
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  /** mutation 放在卡片那一层,中途关掉弹窗也不会把"正在检测"弄丢 */
+  check: ReturnType<typeof useProxyCheck>;
+}) {
+  const record = useLastProxyCheck(acc.id).data;
+  // 三种状态必须分开:没测过 / 检测没做成(我们没问到) / 测完了(才有资格谈通不通、快不快)
+  const done = record && record.success ? record : null;
+  const run = () => check.mutate(acc.id);
+
+  const targets = done?.targets || [];
+  const down = targets.filter((t) => !t.ok);
+  const worst = worstMinMs(targets);
+  const grade = worst === undefined ? null : gradeLatency(worst);
+  const jittery = targets.filter(isJittery);
+
+  // 这份结果是**那一次**的配置跑出来的。代理换了之后数字就不再对应现在生效的配置 ——
+  // 拿旧链路的成绩给新代理背书是最容易误判的一种。(两边都是同一个打码函数的产物,可以直接比。)
+  const staleCfg = !!done && done.proxy !== (acc.proxyUrl || "");
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="w-[95vw] sm:w-full sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <Activity className="w-4 h-4" />
+            链路检测 · {acc.name}
+          </DialogTitle>
+          <DialogDescription>
+            用这个账户<b>已保存</b>的出站配置实测到 OVH 的连通性与延迟,每个目标采样 3 次。
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-3 py-1 max-h-[65vh] overflow-y-auto -mx-6 px-6">
+          {/* 这一次走的是什么配置。代理地址是打过码的,和编辑框里那份写法一致,可以直接核对 */}
+          <div className="rounded-xl border border-border bg-secondary/30 px-3 py-2.5 space-y-1.5">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className="font-semibold text-[13px]">{done ? done.accountName : acc.name}</span>
+              <span
+                className={cn(
+                  "inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium",
+                  accountChipColor(done ? done.region : acc.zone)
+                )}
+              >
+                {done ? `大区 ${done.region}` : acc.zone}
+              </span>
+              {(done ? done.usingProxy : !!acc.proxyUrl) ? (
+                <Chip tone="info">
+                  <Network className="w-3 h-3" />
+                  <span className="font-mono">{(done ? done.proxy : acc.proxyUrl) || "代理"}</span>
+                </Chip>
+              ) : (
+                <Chip>直连</Chip>
+              )}
+              <Chip>
+                <Fingerprint className="w-3 h-3" />
+                {done ? done.fingerprint : acc.fingerprint || "default"}
+              </Chip>
+            </div>
+            <p className="text-[11px] text-muted-foreground leading-relaxed">
+              {done
+                ? `只测这个账户真正会打的那个大区(${done.region})。它根本不会去访问另外两个区,把那些也列出来只会让人对着不相干的红点发愁。`
+                : "走的是这个账户已保存的出站配置,和真实下单同一条链路。"}
+            </p>
+            {staleCfg && (
+              <p className="text-[11px] text-warning">
+                ⚠ 下面这份结果是用{" "}
+                <span className="font-mono">{done?.proxy || "直连"}</span>{" "}
+                跑的,跟这个账户现在的配置对不上了 —— 重新检测一次再下结论。
+              </p>
+            )}
+          </div>
+
+          {/* 请求没发出去 ≠ 链路不通:前者是我们什么都没测到,绝不能画成红点 */}
+          {check.isError && (
+            <LoadFailedBanner
+              title="链路检测请求没发出去 —— 这不代表链路有问题,是我们没问到"
+              error={check.error}
+              onRetry={run}
+            />
+          )}
+
+          {check.isPending ? (
+            <div className="space-y-2">
+              <p className="text-[11px] text-muted-foreground flex items-center gap-1.5">
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                正在检测:每个目标真打 3 次再取最小 / 平均,要几秒。
+              </p>
+              <Skeleton className="h-20 rounded-2xl" />
+              <Skeleton className="h-24 rounded-2xl" />
+            </div>
+          ) : record && !record.success ? (
+            <div className="rounded-xl border border-destructive/40 bg-destructive/5 px-3 py-2.5 space-y-1 text-[11px]">
+              <p className="font-semibold text-destructive flex items-center gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5" />
+                后端没做成这次检测
+              </p>
+              <p className="text-muted-foreground break-all">{record.error}</p>
+              <p className="text-muted-foreground">
+                这不是"链路不通" —— 检测压根没跑起来,链路是好是坏现在仍然未知。
+              </p>
+            </div>
+          ) : done ? (
+            <>
+              {/* 出口 IP:隔离到底生没生效,只能靠它 */}
+              <div
+                className={cn(
+                  "rounded-xl border px-3 py-2.5 space-y-1",
+                  done.egressIP ? "border-success/40 bg-success/5" : "border-destructive/40 bg-destructive/5"
+                )}
+              >
+                <p className="text-[11px] text-muted-foreground">这个账户实际用的出口 IP</p>
+                {done.egressIP ? (
+                  <>
+                    <p className="text-2xl font-mono font-semibold tracking-tight break-all">{done.egressIP}</p>
+                    <p className="text-[11px] text-muted-foreground">
+                      拿它跟别的账户比一比:两个账户测出同一个 IP,OVH 就把它们算作同一个来源,限流互相拖累。
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-[13px] font-semibold text-destructive flex items-center gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5" />
+                      没查到出口 IP
+                    </p>
+                    <p className="text-[11px] text-destructive break-all">{done.egressError || "后端没给原因"}</p>
+                    <p className="text-[11px] text-muted-foreground">
+                      查出口 IP 用的是第三方站点,它自己挂掉不代表到 OVH 的链路有问题 —— 以下面的目标为准。
+                    </p>
+                  </>
+                )}
+                {done.warning && <p className="text-[11px] text-warning">⚠ {done.warning}</p>}
+              </div>
+
+              {/* 目标列表 + 结论。数字必须配结论:用户没法凭 620ms 这个数自己判断该不该换代理 */}
+              <div className="space-y-2">
+                <p className="text-[12px] font-semibold">到 OVH 的连通性与延迟</p>
+                {targets.length === 0 ? (
+                  <p className="text-[11px] text-muted-foreground">
+                    这次后端一个目标都没返回 —— 链路好坏无从判断,重测一次。
+                  </p>
+                ) : (
+                  <div className="space-y-1.5">
+                    {targets.map((t) => (
+                      <ProbeRow key={t.name + t.url} t={t} />
+                    ))}
+                  </div>
+                )}
+
+                {down.length > 0 && (
+                  <div className="rounded-xl border border-destructive/40 bg-destructive/5 px-3 py-2 text-[11px] space-y-0.5">
+                    <p className="font-semibold text-destructive">
+                      {down.length} 个目标连响应都没拿到 —— 这个账户现在下不出单
+                    </p>
+                    <p className="text-muted-foreground">
+                      {done.usingProxy
+                        ? "配了代理就不会退回直连,链路断着等于该账户此刻一单也下不出去。修代理,或者改回直连。"
+                        : "直连都打不到 OVH,说明是这台机器本身出不去网,跟代理无关。"}
+                    </p>
+                  </div>
+                )}
+
+                {grade && (
+                  <div className={cn("rounded-xl border px-3 py-2 text-[11px] space-y-0.5", latencyBox[grade.level])}>
+                    <p className={cn("font-semibold", latencyText[grade.level])}>
+                      最慢的一条 {worst}ms · {latencyLabel[grade.level]}
+                    </p>
+                    <p className="text-muted-foreground">{grade.note}</p>
+                  </div>
+                )}
+
+                {/* 抖动单独说:平均值本身不显眼,但"不定时慢一拍"恰恰是抢购最怕的 */}
+                {jittery.length > 0 && (
+                  <div className="rounded-xl border border-warning/40 bg-warning/5 px-3 py-2 text-[11px] space-y-0.5">
+                    <p className="font-semibold text-warning">
+                      抖动大:{jittery.map((t) => t.name).join("、")}
+                    </p>
+                    <p className="text-muted-foreground">
+                      平均耗时是最小耗时的一倍以上 —— 这条链路会不定时慢一拍,而那一拍就决定抢不抢得到。
+                      平时看着快没有用,补货那一刻撞上就没了。
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* 读法:不写清楚的话,一个 404 会被当成"代理坏了"而去换一个好好的代理 */}
+              <div className="rounded-xl border border-border bg-secondary/30 px-3 py-2.5 space-y-1 text-[11px] leading-relaxed text-muted-foreground">
+                <p className="font-semibold text-foreground">怎么看这几行</p>
+                <p>
+                  拿到<b>任何</b> HTTP 响应就算连通。上面的 HTTP 404 / 302 只说明那个路径不存在或者要跳转,
+                  <b>不代表代理有问题</b>。真正的不通是连响应都没有:红点 + 一条错误信息。
+                </p>
+                <p>
+                  延迟取 3 次采样的最小值和平均值。最小值是这条链路的最好情况,平均值比最小值大一倍以上就是抖动大。
+                </p>
+              </div>
+            </>
+          ) : !check.isError ? (
+            <div className="rounded-xl border border-border px-3 py-5 text-center space-y-1">
+              <p className="text-[12px] font-medium">还没检测过这个账户的链路</p>
+              <p className="text-[11px] text-muted-foreground leading-relaxed">
+                检测会真的去打 OVH,所以打开弹窗不会自动开始。点下面的「开始检测」,
+                结果会留着 —— 下次打开还看得到这一次的数字和时间。
+              </p>
+            </div>
+          ) : null}
+        </div>
+
+        <DialogFooter className="flex-wrap gap-2 space-x-0 sm:justify-between items-center">
+          <span className="text-[11px] text-muted-foreground">
+            {check.isPending
+              ? "检测中…"
+              : record
+                ? `上次检测 ${proxyCheckTime(record).toLocaleString("zh-CN")}`
+                : "尚未检测"}
+          </span>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" onClick={() => onOpenChange(false)}>
+              关闭
+            </Button>
+            <Button onClick={run} disabled={check.isPending}>
+              <RefreshCw className={cn("w-3.5 h-3.5", check.isPending && "animate-spin")} />
+              {check.isPending ? "检测中…" : record ? "立即重新检测" : "开始检测"}
+            </Button>
+          </div>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 

@@ -149,6 +149,10 @@ export const qk = {
   accounts: {
     proxyStatus: () => ["accounts", "proxy-status"] as const,
     proxyTest: (accountId: string) => ["accounts", "proxy-test", accountId] as const,
+    // 链路检测同理,也没有对应的 GET,只是「链路检测」那一下把结果存起来的地方。
+    // 它比出口 IP 测试贵得多(每个目标真打 3 次),所以结果必须留住:
+    // 关掉弹窗再打开看到的是上次那份 + 那次的时间,而不是又去打一轮 OVH。
+    proxyCheck: (accountId: string) => ["accounts", "proxy-check", accountId] as const,
   },
 
   // 历史与日志

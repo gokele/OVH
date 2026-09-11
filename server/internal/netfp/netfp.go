@@ -13,6 +13,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -461,4 +462,107 @@ func SharedProxy() string {
 	sharedMu.RLock()
 	defer sharedMu.RUnlock()
 	return ScrubProxyURL(sharedProxy)
+}
+
+// ── 连通性与延迟检测 ──────────────────────────────────────────────────────
+
+// Probe 一个探测目标的结果。
+type Probe struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+	// Status 拿到的 HTTP 状态码。**任何**响应都说明链路是通的 ——
+	// 404/302 只代表那个路径不存在或要跳转，不代表代理有问题。
+	Status int `json:"status,omitempty"`
+	// MinMS / AvgMS 多次采样的最小值与平均值（毫秒）。
+	//
+	// 为什么要两个：单次采样噪声很大，而抢购真正在意的是**稳定的**延迟。
+	// min 是这条链路的最好情况，avg 与 min 差得远就说明抖动大 ——
+	// 抖动大的代理在补货那一刻会不定时地慢一拍，而那一拍就决定抢不抢得到。
+	MinMS int64  `json:"minMs,omitempty"`
+	AvgMS int64  `json:"avgMs,omitempty"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+// probeSamples 每个目标采几次。3 次足够看出抖动，又不会把检测本身拖成十几秒。
+const probeSamples = 3
+
+// ProbeTarget 探测一个地址：采样 probeSamples 次，返回最小与平均耗时。
+//
+// 判定「通」的标准是**拿到了任何 HTTP 响应**，而不是 200 ——
+// 用 404 或 302 判失败会把「链路正常但这个路径不存在」误报成代理故障。
+func ProbeTarget(o Options, name, url string) Probe {
+	p := Probe{Name: name, URL: url}
+	if o.Timeout == 0 {
+		o.Timeout = 10 * time.Second
+	}
+	cli, err := Client(o)
+	if err != nil {
+		p.Error = err.Error()
+		return p
+	}
+	var total time.Duration
+	var min time.Duration
+	ok := 0
+	for i := 0; i < probeSamples; i++ {
+		req, rerr := http.NewRequest(http.MethodGet, url, nil)
+		if rerr != nil {
+			p.Error = rerr.Error()
+			return p
+		}
+		start := time.Now()
+		resp, derr := cli.Do(req)
+		elapsed := time.Since(start)
+		if derr != nil {
+			// 第一次就失败通常就是不通了，但仍然把后面几次跑完 ——
+			// 偶发一次超时和"完全不通"是两回事，而用户要据此判断要不要换代理。
+			if p.Error == "" {
+				p.Error = derr.Error()
+			}
+			continue
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		p.Status = resp.StatusCode
+		ok++
+		total += elapsed
+		if min == 0 || elapsed < min {
+			min = elapsed
+		}
+	}
+	if ok == 0 {
+		return p
+	}
+	p.OK = true
+	p.MinMS = min.Milliseconds()
+	p.AvgMS = (total / time.Duration(ok)).Milliseconds()
+	// 有成功的采样就不要再挂着那条偶发错误了，否则界面上"通了但红着"
+	if ok == probeSamples {
+		p.Error = ""
+	}
+	return p
+}
+
+// ProbeAll 并发探测一组目标。
+//
+// 并发而不是串行：串行 6 个目标 × 3 次采样 × 1 秒 = 十几秒，
+// 用户会以为卡死了。并发之间互不影响延迟读数（各自独立连接）。
+func ProbeAll(o Options, targets []ProbeSpec) []Probe {
+	out := make([]Probe, len(targets))
+	var wg sync.WaitGroup
+	for i, t := range targets {
+		wg.Add(1)
+		go func(i int, t ProbeSpec) {
+			defer wg.Done()
+			out[i] = ProbeTarget(o, t.Name, t.URL)
+		}(i, t)
+	}
+	wg.Wait()
+	return out
+}
+
+// ProbeSpec 一个待探测的目标。
+type ProbeSpec struct {
+	Name string
+	URL  string
 }
