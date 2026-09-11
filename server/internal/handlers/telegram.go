@@ -420,54 +420,41 @@ func handleTelegramMessage(state *app.State, mon *monitor.Monitor, u *updateCtx,
 	}
 	state.Logger.Info(fmt.Sprintf("解析下单消息: planCode=%s, datacenter=%s, quantity=%d, options=%v",
 		orderInfo.PlanCode, orderInfo.Datacenter, orderInfo.Quantity, orderInfo.Options), "telegram")
-	// 账户按 planCode 反推,不用"上次切到哪个"。
-	// 那种模态设计的失败方式是:三天前切到美区,今天下一台欧区机器,
-	// 闷头落到美区 —— OVH 回 200 + 空数组而不是报错,表现就是永远抢不到。
+	// —— 账户怎么定 ——
+	//
+	// 1) 命令里显式写了 @账户 → 照做，**不再确认**。
+	//    用户已经明确表达过了，再拦一下纯属碍事，而抢购最不能忍的就是多一次往返。
+	// 2) 没写 → 按 planCode 查它在哪个账户的目录里，然后**确认一次**再下。
+	//    账户选错的后果是"永远抢不到"，OVH 不报错、日志里也没异常 ——
+	//    用户唯一能发现的机会就是下单前看到它落在哪儿。
+	if ref := orderInfo.AccountRef; ref != "" {
+		accs, errMsg := resolveAccountRef(state, mon, ref, orderInfo.PlanCode)
+		if errMsg != "" {
+			telegram.SendReply(state, chatID, "❌ "+errMsg, int64(messageID))
+			u.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "bad_account_ref"})
+			return
+		}
+		telegram.SendReply(state, chatID, runOrder(state, orderInfo, accs), int64(messageID))
+		u.JSON(http.StatusOK, gin.H{"ok": true})
+		return
+	}
+
 	ra := resolveOrderAccount(state, mon, orderInfo.PlanCode)
 	if ra.Account.ID == "" {
-		// 真的一个账户都没有 —— 这时候没什么可退回的
 		telegram.SendReply(state, chatID, "❌ 无法下单\n\n"+ra.Reason, int64(messageID))
 		u.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "no_account"})
 		return
 	}
-	if len(ra.Ambiguous) > 1 {
-		// 同一个大区里有好几个账户 —— 光看 planCode 决定不了用哪个,让用户挑一次。
-		askOrderAccount(state, chatID, int64(messageID), orderInfo, ra)
-		u.JSON(http.StatusOK, gin.H{"ok": true, "handled": "ask_account"})
-		return
-	}
-
-	result := telegram.ProcessOrder(state, ra.Account.ID, orderInfo.PlanCode, orderInfo.Datacenter, orderInfo.Quantity, orderInfo.Options)
-	var reply string
-	if result.Success {
-		dcText := "所有可用机房"
-		if orderInfo.Datacenter != "" {
-			dcText = strings.ToUpper(orderInfo.Datacenter)
+	// 候选账户：能买这个 planCode 的都列出来，让确认那一步可以一键改
+	alt := []types.OVHAccount{ra.Account}
+	if mon != nil {
+		if buyable := mon.AccountsForPlan(orderInfo.PlanCode); len(buyable) > 0 {
+			alt = buyable
 		}
-		optsText := "所有可用配置"
-		if len(orderInfo.Options) > 0 {
-			optsText = strings.Join(orderInfo.Options, ", ")
-		}
-		// 这里只是把任务加进抢购队列,还没有真的下单 ——
-		// 措辞不能写"下单成功",那会让用户以为已经买到了。
-		// 另外不指定机房时任务数 = 配置数 × 有货机房数 × 数量,
-		// 可能远超用户直觉,必须把总数醒目地摆出来。
-		reply = fmt.Sprintf("📥 已创建 %d/%d 个抢购任务\n\n型号: %s\n机房: %s\n数量: %d\n配置: %s\n%s\n\n"+
-			"系统将自动尝试下单;每个任务下单成功后会单独通知(注意:下单成功≠已付款)。\n"+
-			"查看 /queue · 取消 /cancel all",
-			result.CreatedOrders, result.TotalOrders, orderInfo.PlanCode, dcText, orderInfo.Quantity, optsText,
-			explainAccountChoice(ra, orderInfo.PlanCode))
-	} else {
-		// 文本下单是「现在就买」:ProcessOrder 要求机器此刻有货,全区无货直接拒绝,
-		// 一个任务都不建。而抢购的常态恰恰是现在没货 —— 用户在这一刻最需要知道
-		// 的就是"可以挂个 /watch 等补货",否则他只会以为这工具坏了,或者反复手动重发。
-		reply = "❌ 下单失败\n\n" + result.Message +
-			"\n\n💡 如果只是现在没货，可以挂着等补货：\n" +
-			"  /watch " + orderInfo.PlanCode + "        补货就通知你\n" +
-			"  /watch " + orderInfo.PlanCode + " x1     补货自动抢 1 台"
 	}
-	telegram.SendReply(state, chatID, reply, int64(messageID))
-	u.JSON(http.StatusOK, gin.H{"ok": true})
+	askOrderConfirm(state, chatID, int64(messageID), orderInfo, ra, alt)
+	u.JSON(http.StatusOK, gin.H{"ok": true, "handled": "order_confirm"})
+	return
 }
 
 // parseUpdateID 从 update JSON 里取 update_id（JSON 数字解出来可能是 float64 / json.Number）

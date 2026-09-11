@@ -337,30 +337,65 @@ func (m *Monitor) buildAvailabilityAlert(planCode string, availableDCs []map[str
 		// 记一行是为了在"按钮下到了错误大区"的事故里能一眼看出按钮当时是无账户的。
 		m.state.Logger.Debug("一键下单按钮无法解析账户归属，回调时将退回默认账户: "+planCode, "monitor")
 	}
-	for idx, dcInfo := range availableDCs {
+
+	// 能买这台机器的账户。多于一个时每个机房 × 每个账户各一颗按钮 ——
+	// 抢稀缺机器时多账户就是多一次机会,而看到补货通知那一刻是最不该去打字切账户的时候。
+	//
+	// 只认目录,不解析 planCode 后缀:实测美区目录里 42 个 `-eu` 后缀的机型
+	// 卖的是欧洲机房的机器,却要用**美区**账户下单。
+	btnAccounts := m.AccountsForPlan(planCode)
+	if len(btnAccounts) <= 1 {
+		// 判不出来 / 只有一个能买 → 保持老样子:每个机房一颗按钮,账户走上面解析出来的那个
+		btnAccounts = nil
+	}
+	// 按钮总数封顶。5 个机房 × 3 个账户 = 15 颗,手机上会把消息挤得没法看,
+	// Telegram 对键盘也有上限。超了就退回"每机房一颗",账户仍按订阅解析。
+	if len(btnAccounts) > 0 && len(availableDCs)*len(btnAccounts) > maxOrderButtons {
+		m.state.Logger.Debug(fmt.Sprintf("按钮数 %d×%d 超过上限 %d,退回每机房一颗",
+			len(availableDCs), len(btnAccounts), maxOrderButtons), "monitor")
+		btnAccounts = nil
+	}
+
+	// 一颗按钮 = 一个 (机房, 账户) 组合
+	type target struct {
+		dc        string
+		accountID string
+		label     string
+	}
+	targets := []target{}
+	for _, dcInfo := range availableDCs {
 		dc, _ := dcInfo["dc"].(string)
+		if len(btnAccounts) == 0 {
+			targets = append(targets, target{dc: dc, accountID: btnAccountID,
+				label: dcDisplayShortName(dc) + " 一键下单"})
+			continue
+		}
+		for _, a := range btnAccounts {
+			targets = append(targets, target{dc: dc, accountID: a.ID,
+				label: dcDisplayShortName(dc) + " · " + a.Name})
+		}
+	}
+
+	for idx, t := range targets {
 		msgUUID := uuid.NewString()
-		m.AddMessageUUID(msgUUID, planCode, dc, options, configInfo)
-		// AddMessageUUID 在 subscriptions.go(不在本次改动范围),它只写不带账户的行,
-		// 这里紧接着补写 account_id。失败只退回"默认账户"的老行为,不影响按钮可用。
-		if btnAccountID != "" && m.state.DB != nil {
-			if err := m.state.DB.SetTelegramButtonAccount(msgUUID, btnAccountID); err != nil {
+		m.AddMessageUUID(msgUUID, planCode, t.dc, options, configInfo)
+		// AddMessageUUID 只写不带账户的行,这里紧接着补写 account_id。
+		// 失败只退回"默认账户"的老行为,不影响按钮可用。
+		if t.accountID != "" && m.state.DB != nil {
+			if err := m.state.DB.SetTelegramButtonAccount(msgUUID, t.accountID); err != nil {
 				m.state.Logger.Warn("一键下单按钮账户归属落库失败（回调将退回默认账户）: "+err.Error(), "telegram")
 			}
 		}
 		m.state.Logger.Debug(fmt.Sprintf("生成消息UUID: %s, 配置: %s@%s, options=%v, account=%s",
-			msgUUID, planCode, dc, options, btnAccountID), "monitor")
+			msgUUID, planCode, t.dc, options, t.accountID), "monitor")
 
 		cb := map[string]string{"a": "add_to_queue", "u": msgUUID}
 		cbStr, _ := json.Marshal(cb)
 		if len(cbStr) > 64 {
 			m.state.Logger.Warn(fmt.Sprintf("UUID callback_data异常长: %d字节, UUID=%s", len(cbStr), msgUUID), "monitor")
 		}
-		row = append(row, btn{
-			Text:         dcDisplayShortName(dc) + " 一键下单",
-			CallbackData: string(cbStr),
-		})
-		if len(row) >= 2 || idx == len(availableDCs)-1 {
+		row = append(row, btn{Text: t.label, CallbackData: string(cbStr)})
+		if len(row) >= 2 || idx == len(targets)-1 {
 			keyboard = append(keyboard, row)
 			row = nil
 		}
@@ -594,6 +629,10 @@ func (m *Monitor) SendNewServerAlert(server map[string]interface{}) {
 	notify.Broadcast(m.state, msg, nil)
 	m.state.Logger.Info(fmt.Sprintf("发送新服务器提醒: %v", server["planCode"]), "monitor")
 }
+
+// maxOrderButtons 上架通知里最多放几颗一键下单按钮。
+// 超了就不按账户铺开 —— 手机上一屏塞十几颗按钮没法用,Telegram 对键盘也有上限。
+const maxOrderButtons = 10
 
 // activeQueueCount 这个型号当前有几个进行中的抢购任务。
 //

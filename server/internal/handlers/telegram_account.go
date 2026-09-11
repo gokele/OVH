@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/ovh-buy/server/internal/app"
@@ -119,4 +120,180 @@ func askOrderAccount(state *app.State, chatID interface{}, messageID int64,
 		"👤 %s 属于 %s 区，而你在这个区有 %d 个账户 —— 用哪个下单？\n\n"+
 			"（选完会记住，同一个区之后不再问；换别的区的机型会自动切）",
 		info.PlanCode, ra.Region, len(ra.Ambiguous)), flowKeyboard(tok, labels))
+}
+
+// accountShortName 账户的短名，用在 `@xxx` 里。
+//
+// 用子公司而不是账户名：名字可能是中文、带空格、或者两个账户叫得很像，
+// 打起来都不方便；子公司是两三个字母，而且正好对应"哪个区"——
+// 用户真正在意的就是这个。
+// 同一个子公司有多个账户时只能用序号区分，/accounts 里会把序号标出来。
+func accountShortName(a types.OVHAccount) string {
+	return strings.ToLower(strings.TrimSpace(a.Zone))
+}
+
+// resolveAccountRef 把命令里的 `@xxx` 解析成具体账户。
+//
+//	"all"    → 所有能买这个 planCode 的账户（各下一单）
+//	"<n>"    → /accounts 列表里的第 n 个
+//	"<zone>" → 该子公司的账户；有多个时要求用序号，不猜
+//
+// 解析不出来一律返回错误，绝不"猜一个最像的" ——
+// 猜错的后果是下到另一个账户上，而那不会报错，只会一直抢不到。
+func resolveAccountRef(state *app.State, mon *monitor.Monitor, ref, planCode string) ([]types.OVHAccount, string) {
+	all := listAccounts(state)
+	if len(all) == 0 {
+		return nil, "还没有配置 OVH 账户。"
+	}
+	ref = strings.ToLower(strings.TrimSpace(ref))
+
+	if ref == "all" {
+		if mon != nil {
+			if buyable := mon.AccountsForPlan(planCode); len(buyable) > 0 {
+				return buyable, ""
+			}
+		}
+		// 判不出来哪些能买（目录还没热等）→ 用全部账户，并让调用方说清楚。
+		// 这里宁可多投也不少投：@all 的语义就是"能试的都试"，
+		// 而拒绝执行等于让一次目录抖动毁掉一次补货。
+		return all, ""
+	}
+
+	// @1 / @2：按 /accounts 的显示顺序
+	if n, err := strconv.Atoi(ref); err == nil {
+		if n < 1 || n > len(all) {
+			return nil, fmt.Sprintf("没有第 %d 个账户（一共 %d 个）。发 /accounts 看序号。", n, len(all))
+		}
+		return []types.OVHAccount{all[n-1]}, ""
+	}
+
+	// @us / @ie：按子公司
+	matched := []types.OVHAccount{}
+	for _, a := range all {
+		if accountShortName(a) == ref {
+			matched = append(matched, a)
+		}
+	}
+	switch len(matched) {
+	case 1:
+		return matched, ""
+	case 0:
+		names := make([]string, 0, len(all))
+		for i, a := range all {
+			names = append(names, fmt.Sprintf("@%d(%s)", i+1, accountShortName(a)))
+		}
+		return nil, fmt.Sprintf("没有叫 @%s 的账户。可用的：%s", ref, strings.Join(names, " "))
+	default:
+		idx := []string{}
+		for i, a := range all {
+			if accountShortName(a) == ref {
+				idx = append(idx, fmt.Sprintf("@%d(%s)", i+1, a.Name))
+			}
+		}
+		return nil, fmt.Sprintf("@%s 对应 %d 个账户，用序号指定：%s",
+			ref, len(matched), strings.Join(idx, " "))
+	}
+}
+
+// runOrder 对一组账户依次下单，汇总回复。
+//
+// 多账户时逐个下：每个账户是独立的一单，一个失败不该拖累其它的 ——
+// 抢稀缺机器时"两个账户都投"的全部意义就在于其中一个能成。
+func runOrder(state *app.State, o *telegram.OrderInfo, accs []types.OVHAccount) string {
+	if len(accs) == 1 {
+		res := telegram.ProcessOrder(state, accs[0].ID, o.PlanCode, o.Datacenter, o.Quantity, o.Options)
+		if res.Success {
+			return fmt.Sprintf("📥 已创建 %d/%d 个抢购任务\n\n型号: %s\n账户: %s\n\n"+
+				"系统会一直重试到抢到为止。下单成功≠已付款。\n查看 /queue · 取消 /cancel all",
+				res.CreatedOrders, res.TotalOrders, o.PlanCode, telegram.AccountLabel(accs[0]))
+		}
+		return "❌ 下单失败\n\n" + res.Message +
+			"\n\n💡 如果只是现在没货，可以挂着等补货：/watch " + o.PlanCode
+	}
+
+	var b strings.Builder
+	okCount, total := 0, 0
+	var fails []string
+	for _, a := range accs {
+		res := telegram.ProcessOrder(state, a.ID, o.PlanCode, o.Datacenter, o.Quantity, o.Options)
+		if res.Success {
+			okCount++
+			total += res.CreatedOrders
+			b.WriteString("  ✅ " + telegram.AccountLabel(a) +
+				fmt.Sprintf(" — %d 个任务\n", res.CreatedOrders))
+		} else {
+			fails = append(fails, "  ❌ "+telegram.AccountLabel(a)+" — "+truncate(res.Message, 80))
+		}
+	}
+
+	var head strings.Builder
+	if okCount == 0 {
+		head.WriteString("❌ " + strconv.Itoa(len(accs)) + " 个账户都没能下单\n\n")
+	} else {
+		head.WriteString(fmt.Sprintf("📥 %d/%d 个账户已开抢，共 %d 个任务\n\n", okCount, len(accs), total))
+	}
+	head.WriteString(b.String())
+	for _, f := range fails {
+		head.WriteString(f + "\n")
+	}
+	if okCount > 1 {
+		// 多账户同时抢同一台机器,全中就是多台机器多笔钱。这件事必须说在前面。
+		head.WriteString("\n⚠️ 这几个账户在抢同一台机器，都抢到就是几台、几笔钱。\n" +
+			"   不想要了发 /cancel all。")
+	}
+	head.WriteString("\n查看 /queue")
+	return head.String()
+}
+
+// askOrderConfirm 下单前把账户摆出来让用户确认。
+//
+// 为什么值得多这一步：账户选错的后果是"永远抢不到"，OVH 不报错、日志里也没异常，
+// 用户唯一能发现的机会就是下单前看到它落在哪儿。
+//
+// 命令里显式写了 @账户 的**不走这一步** —— 那时候用户已经明确表达过了，
+// 再拦一下纯属碍事，而抢购最不能忍的就是多一次往返。
+func askOrderConfirm(state *app.State, chatID interface{}, messageID int64,
+	o *telegram.OrderInfo, ra resolvedAccount, alt []types.OVHAccount) {
+
+	f := &watchFlow{
+		Step:     stepOrderConfirm,
+		PlanCode: o.PlanCode,
+		Order:    o,
+		Accounts: alt,
+		Confirm:  []types.OVHAccount{ra.Account},
+	}
+	tok := putFlow(f)
+
+	var b strings.Builder
+	b.WriteString("📋 确认一下\n\n")
+	b.WriteString("型号：" + o.PlanCode + "\n")
+	if o.Datacenter != "" {
+		b.WriteString("机房：" + strings.ToUpper(o.Datacenter) + "\n")
+	} else {
+		b.WriteString("机房：所有有货的\n")
+	}
+	b.WriteString("数量：" + strconv.Itoa(o.Quantity) + " 台/机房\n")
+	if len(o.Options) > 0 {
+		b.WriteString("配置：" + strings.Join(o.Options, ", ") + "\n")
+	}
+	b.WriteString("账户：" + telegram.AccountLabel(ra.Account) + "\n")
+	if !ra.Confident {
+		b.WriteString("⚠️ 没能确认 " + o.PlanCode + " 属于哪个区，这是当前账户。\n" +
+			"   用错区的账户不会报错，只会一直抢不到。\n")
+	}
+	b.WriteString("\n下一步会真的去下单。")
+
+	labels := []string{"✅ 确认下单"}
+	for _, a := range alt {
+		if a.ID == ra.Account.ID {
+			continue
+		}
+		labels = append(labels, "🔀 改用 "+telegram.AccountLabel(a))
+	}
+	if len(alt) > 1 {
+		labels = append(labels, "🚀 每个账户都下一单")
+	}
+	labels = append(labels, "✖️ 取消")
+
+	telegram.SendKeyboard(state, chatID, messageID, b.String(), flowKeyboard(tok, labels))
 }

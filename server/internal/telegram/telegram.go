@@ -190,6 +190,14 @@ func SendReply(state *app.State, chatID interface{}, text string, replyToMessage
 type OrderInfo struct {
 	PlanCode   string
 	Datacenter string
+	// AccountRef 用户在命令里显式指定的账户。原样保留,由 handlers 去解析成具体账户 ——
+	// telegram 包看不到账户列表,也不该看到。
+	//
+	//	"@us" / "@1"  指定一个账户
+	//	"@all"        同区每个能买的账户各下一单(抢稀缺机器时翻倍机会)
+	//
+	// 空 = 没指定,由 planCode 反推。
+	AccountRef string
 	// Quantity 每个机房下几台。有上限,见 MaxOrderQuantity。
 	Quantity int
 	Options  []string
@@ -213,6 +221,20 @@ func ParseOrderMessage(text string) *OrderInfo {
 	if len(parts) > 1 {
 		remaining = parts[1:]
 	}
+	// 先把 @账户 摘出来,它可以出现在任何位置 ——
+	// 手机上打字容易顺手打在末尾,而末尾正好是 options 的地盘。
+	// 摘早一点,下面的机房/数量/配置解析就完全不用知道它的存在。
+	kept := remaining[:0]
+	for _, p := range remaining {
+		if strings.HasPrefix(p, "@") && len(p) > 1 {
+			if result.AccountRef == "" {
+				result.AccountRef = strings.ToLower(p[1:])
+			}
+			continue
+		}
+		kept = append(kept, p)
+	}
+	remaining = kept
 	if len(remaining) == 0 {
 		return result
 	}

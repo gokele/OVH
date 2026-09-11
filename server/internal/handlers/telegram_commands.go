@@ -99,6 +99,11 @@ func helpText() string {
 	b.WriteString(fmt.Sprintf("数量上限 %d 台/次，一条消息最多创建 %d 个任务。\n",
 		telegram.MaxOrderQuantity, telegram.MaxOrderFanout))
 	b.WriteString("机房代码是 3-4 位小写字母（gra / rbx / sbg / bhs / waw…）。\n\n")
+	b.WriteString("【指定账户】在命令里加 @：\n")
+	b.WriteString("  24sk602 gra @us    用美区账户下\n")
+	b.WriteString("  24sk602 gra @2     用 /accounts 里第 2 个账户\n")
+	b.WriteString("  24sk602 gra @all   每个能买的账户各下一单（抢稀缺机器时翻倍机会）\n")
+	b.WriteString("不写 @ 的话我按型号查它在哪个账户的目录里，然后让你确认一次。\n\n")
 	b.WriteString("⚠️ 上面这种是「现在就买」，机器当下没货会直接失败。\n")
 	b.WriteString("   想等补货请用 /watch。\n\n")
 	b.WriteString("【盯补货】机器现在没货时用这个：\n")
@@ -364,7 +369,12 @@ func accountsText(state *app.State, chatID interface{}, messageID int64) string 
 		return b.String()
 	}
 
-	b.WriteString("\n要换就点下面：")
+	b.WriteString("\n下单时可以直接指定：\n")
+	for i, a := range accs {
+		b.WriteString(fmt.Sprintf("  [@%d] 或 [@%s]  %s\n", i+1, accountShortName(a), a.Name))
+	}
+	b.WriteString("  [@all]  每个能买的账户各下一单\n")
+	b.WriteString("\n要换默认的就点下面：")
 	f := &watchFlow{Step: stepSwitchAccount, Accounts: accs}
 	tok := putFlow(f)
 	labels := make([]string, 0, len(accs))

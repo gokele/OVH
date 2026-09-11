@@ -1025,3 +1025,28 @@ func (m *Monitor) AccountsInRegion(region string) []types.OVHAccount {
 	}
 	return out
 }
+
+// AccountsForPlan 所有目录里有这个 planCode 的账户。
+//
+// 用来做两件事：
+//   - `@all`：同区每个能买的账户各下一单。抢稀缺机器时这是多账户真正的价值 ——
+//     以前不管怎么切都只能用一个。
+//   - 上架通知的按钮：每个机房 × 每个能买的账户各一颗，看到补货直接选账户下单。
+//
+// 只认目录（权威），不解析 planCode 后缀 —— 后缀推不出账户：
+// 实测美区目录里 42 个 `-eu` 后缀的机型，卖的是欧洲机房的机器，
+// 但要用**美区**账户下单（它们的 region 配置恒为 united_states）。
+func (m *Monitor) AccountsForPlan(planCode string) []types.OVHAccount {
+	m.state.AccountsMu.RLock()
+	accounts := make([]types.OVHAccount, len(m.state.Accounts))
+	copy(accounts, m.state.Accounts)
+	m.state.AccountsMu.RUnlock()
+
+	out := []types.OVHAccount{}
+	for _, a := range accounts {
+		if in, definitive := m.planInAccountCatalog(a.ID, planCode); definitive && in {
+			out = append(out, a)
+		}
+	}
+	return out
+}

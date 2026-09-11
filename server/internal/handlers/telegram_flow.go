@@ -49,6 +49,8 @@ const (
 	stepSwitchAccount flowStep = "switch_account"
 	// stepOrderAccount 文本下单时同区多账户,挑一次再下。
 	stepOrderAccount flowStep = "order_account"
+	// stepOrderConfirm 文本下单前的确认(没显式写 @账户 时才走)。
+	stepOrderConfirm flowStep = "order_confirm"
 )
 
 type configChoice struct {
@@ -66,8 +68,10 @@ type watchFlow struct {
 	Configs  []configChoice
 	Accounts []types.OVHAccount
 
-	// Order 文本下单挂起时保存的原始解析结果,选完账户接着下。
+	// Order 文本下单挂起时保存的原始解析结果,确认/选完账户接着下。
 	Order *telegram.OrderInfo
+	// Confirm 确认步骤里默认要用的那个账户(第一颗按钮)。
+	Confirm []types.OVHAccount
 
 	PickedOptions []string
 	PickedConfig  string
@@ -367,6 +371,49 @@ func handleFlowCallback(state *app.State, mon *monitor.Monitor, cb map[string]in
 				"\n\n之后的文本下单和 /watch 都会落到这个账户。\n"+
 				"注意：已经在队列里的任务和已存在的订阅不受影响，它们各自记着当初选的账户。",
 			messageID)
+		return true
+
+	case stepOrderConfirm:
+		if f.Order == nil || len(f.Confirm) == 0 {
+			telegram.AnswerCallback(state, fmt.Sprintf("%v", cb["id"]), "选项已失效", true)
+			return true
+		}
+		// 按钮顺序:[确认] [改用 A] [改用 B] ... [每个账户都下] [取消]
+		alt := []types.OVHAccount{}
+		for _, a := range f.Accounts {
+			if a.ID != f.Confirm[0].ID {
+				alt = append(alt, a)
+			}
+		}
+		iConfirm := 0
+		iAll := 1 + len(alt) // 只有 len(f.Accounts) > 1 时才存在
+		iCancel := iAll
+		if len(f.Accounts) > 1 {
+			iCancel = iAll + 1
+		}
+
+		switch {
+		case idx == iCancel:
+			telegram.AnswerCallback(state, fmt.Sprintf("%v", cb["id"]), "已取消", false)
+			telegram.SendReply(state, chatID, "✖️ 已取消，没有创建任何任务。", messageID)
+		case len(f.Accounts) > 1 && idx == iAll:
+			telegram.AnswerCallback(state, fmt.Sprintf("%v", cb["id"]), "全部账户开抢", false)
+			telegram.SendReply(state, chatID, runOrder(state, f.Order, f.Accounts), messageID)
+		case idx == iConfirm:
+			telegram.AnswerCallback(state, fmt.Sprintf("%v", cb["id"]), "开始下单", false)
+			telegram.SendReply(state, chatID, runOrder(state, f.Order, f.Confirm), messageID)
+		case idx > iConfirm && idx-1 < len(alt):
+			picked := alt[idx-1]
+			// 换了账户就记成当前账户:同一个区之后不再问
+			if err := telegram.SetActiveAccount(state, picked.ID); err != nil {
+				state.Logger.Warn("保存 Telegram 当前账户失败(不影响本次下单): "+err.Error(), "telegram")
+			}
+			telegram.AnswerCallback(state, fmt.Sprintf("%v", cb["id"]), "换账户下单", false)
+			telegram.SendReply(state, chatID,
+				runOrder(state, f.Order, []types.OVHAccount{picked}), messageID)
+		default:
+			telegram.AnswerCallback(state, fmt.Sprintf("%v", cb["id"]), "选项无效", true)
+		}
 		return true
 
 	case stepOrderAccount:
