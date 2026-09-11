@@ -420,7 +420,24 @@ func handleTelegramMessage(state *app.State, mon *monitor.Monitor, u *updateCtx,
 	}
 	state.Logger.Info(fmt.Sprintf("解析下单消息: planCode=%s, datacenter=%s, quantity=%d, options=%v",
 		orderInfo.PlanCode, orderInfo.Datacenter, orderInfo.Quantity, orderInfo.Options), "telegram")
-	result := telegram.ProcessOrder(state, orderInfo.PlanCode, orderInfo.Datacenter, orderInfo.Quantity, orderInfo.Options)
+	// 账户按 planCode 反推,不用"上次切到哪个"。
+	// 那种模态设计的失败方式是:三天前切到美区,今天下一台欧区机器,
+	// 闷头落到美区 —— OVH 回 200 + 空数组而不是报错,表现就是永远抢不到。
+	ra := resolveOrderAccount(state, mon, orderInfo.PlanCode)
+	if ra.Account.ID == "" {
+		// 真的一个账户都没有 —— 这时候没什么可退回的
+		telegram.SendReply(state, chatID, "❌ 无法下单\n\n"+ra.Reason, int64(messageID))
+		u.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "no_account"})
+		return
+	}
+	if len(ra.Ambiguous) > 1 {
+		// 同一个大区里有好几个账户 —— 光看 planCode 决定不了用哪个,让用户挑一次。
+		askOrderAccount(state, chatID, int64(messageID), orderInfo, ra)
+		u.JSON(http.StatusOK, gin.H{"ok": true, "handled": "ask_account"})
+		return
+	}
+
+	result := telegram.ProcessOrder(state, ra.Account.ID, orderInfo.PlanCode, orderInfo.Datacenter, orderInfo.Quantity, orderInfo.Options)
 	var reply string
 	if result.Success {
 		dcText := "所有可用机房"
@@ -435,10 +452,11 @@ func handleTelegramMessage(state *app.State, mon *monitor.Monitor, u *updateCtx,
 		// 措辞不能写"下单成功",那会让用户以为已经买到了。
 		// 另外不指定机房时任务数 = 配置数 × 有货机房数 × 数量,
 		// 可能远超用户直觉,必须把总数醒目地摆出来。
-		reply = fmt.Sprintf("📥 已创建 %d/%d 个抢购任务\n\n型号: %s\n机房: %s\n数量: %d\n配置: %s\n\n"+
+		reply = fmt.Sprintf("📥 已创建 %d/%d 个抢购任务\n\n型号: %s\n机房: %s\n数量: %d\n配置: %s\n%s\n\n"+
 			"系统将自动尝试下单;每个任务下单成功后会单独通知(注意:下单成功≠已付款)。\n"+
 			"查看 /queue · 取消 /cancel all",
-			result.CreatedOrders, result.TotalOrders, orderInfo.PlanCode, dcText, orderInfo.Quantity, optsText)
+			result.CreatedOrders, result.TotalOrders, orderInfo.PlanCode, dcText, orderInfo.Quantity, optsText,
+			explainAccountChoice(ra, orderInfo.PlanCode))
 	} else {
 		// 文本下单是「现在就买」:ProcessOrder 要求机器此刻有货,全区无货直接拒绝,
 		// 一个任务都不建。而抢购的常态恰恰是现在没货 —— 用户在这一刻最需要知道

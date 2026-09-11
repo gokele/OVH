@@ -47,6 +47,8 @@ const (
 	// stepSwitchAccount /accounts 里换当前账户。它不属于 /watch 那条流程,
 	// 只是复用同一套 token + 按钮机制。
 	stepSwitchAccount flowStep = "switch_account"
+	// stepOrderAccount 文本下单时同区多账户,挑一次再下。
+	stepOrderAccount flowStep = "order_account"
 )
 
 type configChoice struct {
@@ -63,6 +65,9 @@ type watchFlow struct {
 
 	Configs  []configChoice
 	Accounts []types.OVHAccount
+
+	// Order 文本下单挂起时保存的原始解析结果,选完账户接着下。
+	Order *telegram.OrderInfo
 
 	PickedOptions []string
 	PickedConfig  string
@@ -362,6 +367,30 @@ func handleFlowCallback(state *app.State, mon *monitor.Monitor, cb map[string]in
 				"\n\n之后的文本下单和 /watch 都会落到这个账户。\n"+
 				"注意：已经在队列里的任务和已存在的订阅不受影响，它们各自记着当初选的账户。",
 			messageID)
+		return true
+
+	case stepOrderAccount:
+		if idx < 0 || idx >= len(f.Accounts) || f.Order == nil {
+			telegram.AnswerCallback(state, fmt.Sprintf("%v", cb["id"]), "选项无效", true)
+			return true
+		}
+		acc := f.Accounts[idx]
+		// 记成当前账户:同一个区之后不再问。换别的区的机型时 resolveOrderAccount
+		// 会发现它不在对的区,自动按 planCode 重新解析。
+		if err := telegram.SetActiveAccount(state, acc.ID); err != nil {
+			state.Logger.Warn("保存 Telegram 当前账户失败(不影响本次下单): "+err.Error(), "telegram")
+		}
+		telegram.AnswerCallback(state, fmt.Sprintf("%v", cb["id"]), "开始下单", false)
+		o := f.Order
+		res := telegram.ProcessOrder(state, acc.ID, o.PlanCode, o.Datacenter, o.Quantity, o.Options)
+		if res.Success {
+			telegram.SendReply(state, chatID, fmt.Sprintf(
+				"📥 已创建 %d/%d 个抢购任务\n\n型号: %s\n账户: %s\n\n"+
+					"系统将自动尝试下单;下单成功≠已付款。\n查看 /queue · 取消 /cancel all",
+				res.CreatedOrders, res.TotalOrders, o.PlanCode, telegram.AccountLabel(acc)), messageID)
+		} else {
+			telegram.SendReply(state, chatID, "❌ 下单失败\n\n"+res.Message, messageID)
+		}
 		return true
 
 	case stepAction:

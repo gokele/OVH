@@ -63,7 +63,10 @@ func emptyAvailabilityReason(state *app.State, accountID, planCode string, acc t
 	return base + fmt.Sprintf("\n\n%s 的目录里有 %s,所以不是区域搞错了,而是这个机型当前在所有机房都没有可售配置。", sub, planCode)
 }
 
-func ProcessOrder(state *app.State, planCode, datacenter string, quantity int, options []string) OrderResult {
+// accountID 由调用方解析好传进来(按 planCode 反推大区,见 handlers.resolveOrderAccount)。
+// 空串 = 退回当前账户 —— 但正常路径不该走到那里:
+// 账户选错的后果是"永远抢不到"且 OVH 不报错,必须在下单前就定死。
+func ProcessOrder(state *app.State, accountID, planCode, datacenter string, quantity int, options []string) OrderResult {
 	if quantity < 1 {
 		quantity = 1
 	}
@@ -73,11 +76,14 @@ func ProcessOrder(state *app.State, planCode, datacenter string, quantity int, o
 	// 下单时才由 purchase 现取默认账户 —— 中间只要有人改过默认账户(或删掉它),
 	// 这一单就会用另一个账户、另一个区的凭据去下,而可用性/目录判断用的
 	// 还是此刻这个账户的子公司,两边对不上。
-	acc, ok := ActiveAccount(state)
+	acc, ok := state.FindAccount(accountID)
 	if !ok {
-		return OrderResult{Success: false, Message: "未配置任何 OVH 账户"}
+		acc, ok = ActiveAccount(state)
+		if !ok && acc.ID == "" {
+			return OrderResult{Success: false, Message: "未配置任何 OVH 账户"}
+		}
 	}
-	accountID := acc.ID
+	accountID = acc.ID
 	sub, accLabel := accountRegionLabel(acc)
 
 	availByConfig := catalog.CheckServerAvailabilityWithConfigs(state, planCode, accountID)

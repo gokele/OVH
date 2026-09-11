@@ -934,3 +934,94 @@ func configMatchesFilter(want, have []string) bool {
 
 // ConfigMatchesFilter 导出版，给测试和别的包用。语义见 configMatchesFilter。
 func ConfigMatchesFilter(want, have []string) bool { return configMatchesFilter(want, have) }
+
+// PlanAccount 给定 planCode，解析出「哪个账户能买到它」。
+//
+// 为什么下单要走这个而不是让用户自己选账户：
+// 用户真正在意的从来不是"用哪个账户"，而是"别落到一个买不到这台机器的账户上"。
+// 而 planCode 本身就带着区域信息 —— OVH 的 EU / US / CA 是三套彼此独立的系统，
+// 同一台机器在不同区是不同的型号代码（美区通常带 -us 后缀）。
+// 拿欧区 planCode 打美区接口，OVH 回的是 200 + 空数组而**不是报错**，
+// 表现就是"永远抢不到"，日志里也没有异常，用户完全看不出是账户选错了。
+//
+// 所以账户是可以算出来的，不该让人记着自己上次切到哪个区了。
+//
+// prefer 非空且它所在大区确实有这个 planCode 时优先用它 ——
+// 这是给"同一个大区有好几个账户"准备的，那种情况算不出来该用哪个。
+//
+// 返回值：accountID 为空表示没找到能买的账户，reason 里是给用户看的中文说明。
+func (m *Monitor) PlanAccount(planCode, prefer string) (accountID, region, subsidiary, reason string) {
+	// prefer 先验一遍:它所在大区有这个 plan 才认,否则当没传 ——
+	// 否则又退化成"用户选了什么就用什么",区域错配照样发生。
+	if prefer != "" {
+		if acc, ok := m.state.FindAccount(prefer); ok {
+			if in, definitive := m.planInAccountCatalog(acc.ID, planCode); definitive && in {
+				r, sub := accountRegionInfo(acc)
+				return acc.ID, r, sub, ""
+			}
+		}
+	}
+	c := m.resolveQueryAccount(planCode, "")
+	return c.accountID, c.region, c.subsidiary, c.degradeReason
+}
+
+// PlanAccountFast 只查已缓存的目录,不做跨区可用性探测。
+//
+// 给交互式路径用(Telegram 下单):探测要逐个大区打 OVH,实测能到好几秒,
+// 而补货那一刻每一秒都算数。目录本身有 2 小时缓存,命中就是零延迟。
+//
+// 判不出来时返回空 accountID —— 调用方**不要**据此拒绝下单,
+// 退回当前账户并把"没能确认"这件事说出来就行:
+// 判不出来的原因往往只是目录还没热,而不是真的没有合适的账户。
+func (m *Monitor) PlanAccountFast(planCode, prefer string) (accountID, region, subsidiary string) {
+	try := func(acc types.OVHAccount) (string, string, string, bool) {
+		if in, definitive := m.planInAccountCatalog(acc.ID, planCode); definitive && in {
+			r, sub := accountRegionInfo(acc)
+			return acc.ID, r, sub, true
+		}
+		return "", "", "", false
+	}
+	if prefer != "" {
+		if acc, ok := m.state.FindAccount(prefer); ok {
+			if id, r, sub, hit := try(acc); hit {
+				return id, r, sub
+			}
+		}
+	}
+	m.state.AccountsMu.RLock()
+	accounts := make([]types.OVHAccount, len(m.state.Accounts))
+	copy(accounts, m.state.Accounts)
+	m.state.AccountsMu.RUnlock()
+	// 默认账户优先,保证单账户/同区用户的行为和以前完全一致
+	for _, a := range accounts {
+		if !a.IsDefault {
+			continue
+		}
+		if id, r, sub, hit := try(a); hit {
+			return id, r, sub
+		}
+	}
+	for _, a := range accounts {
+		if a.IsDefault {
+			continue
+		}
+		if id, r, sub, hit := try(a); hit {
+			return id, r, sub
+		}
+	}
+	return "", "", ""
+}
+
+// AccountsInRegion 某个大区下的所有账户。
+// 同区多账户时得让用户挑一次 —— 那种情况光看 planCode 算不出来用哪个。
+func (m *Monitor) AccountsInRegion(region string) []types.OVHAccount {
+	m.state.AccountsMu.RLock()
+	defer m.state.AccountsMu.RUnlock()
+	out := []types.OVHAccount{}
+	for _, a := range m.state.Accounts {
+		if r, _ := accountRegionInfo(a); r == region {
+			out = append(out, a)
+		}
+	}
+	return out
+}

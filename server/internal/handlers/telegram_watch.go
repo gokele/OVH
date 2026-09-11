@@ -78,12 +78,23 @@ func watchText(state *app.State, mon *monitor.Monitor, args []string) string {
 	accountID := ""
 	accLabel := ""
 	if autoOrder {
-		acc, ok := telegram.ActiveAccount(state)
-		if !ok && acc.ID == "" {
+		// 账户按 planCode 反推,不用"上次切到哪个" ——
+		// 订阅是要挂着长期跑的,落错区的表现是"永远等不到货",
+		// 而那和"这机器一直没补货"在界面上一模一样。
+		ra := resolveOrderAccount(state, mon, planCode)
+		if ra.Account.ID == "" {
 			return "要自动下单得先配置 OVH 账户。请到控制台「设置 → OVH 账户」添加，或者去掉 x<数量> 只接收通知。"
 		}
-		accountID = acc.ID
-		accLabel = telegram.AccountLabel(acc)
+		accountID = ra.Account.ID
+		accLabel = telegram.AccountLabel(ra.Account)
+		if ra.Confident {
+			accLabel += fmt.Sprintf("（%s 在它的目录里，已自动选定）", planCode)
+		} else {
+			// 判不出来不拒绝,但必须说 —— 订阅是挂着长期跑的,
+			// 落错区的表现是"永远等不到货",和"这机器一直没补货"在界面上一模一样。
+			accLabel += "\n⚠️ 没能确认 " + planCode + " 属于哪个区，用的是当前账户。" +
+				"\n   用错区的账户不会报错，只会一直抢不到。换账户发 /accounts。"
+		}
 	}
 
 	if quantity > telegram.MaxOrderQuantity {
