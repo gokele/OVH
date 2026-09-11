@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -545,8 +546,6 @@ func main() {
 			console.Error("⚠️  并且监听所有网卡(LISTEN_HOST 为空):同网段任何人都能用默认密钥操作你的 OVH 账户")
 		}
 	}
-	console.Info("Listening", "addr", addr, "auth", enableAuth, "ui", hasUI(), "dataDir", paths.DataDir)
-
 	srv := &http.Server{Addr: addr, Handler: r}
 
 	// 端口真正 Listen 成功之后才标记"这一版能跑" —— 此时数据库已打开、路由已注册、
@@ -556,16 +555,27 @@ func main() {
 	// 自己 Listen 而不是用 ListenAndServe + sleep:后者只能靠"睡几秒应该起来了"猜,
 	// 猜早了端口还没占上就宣布健康,猜晚了这几秒里被重启一次就会被误判成启动失败。
 	// 拿到 listener 就是确凿的成功信号,没有窗口。
-	ln, err := net.Listen("tcp", addr)
+	ln, err := listenWithRetry(addr, state)
 	if err != nil {
-		console.Error("listen", "err", err)
+		// 这里失败就是整个程序没起来。以前"Listening"和"Server started"两行
+		// 打在 Listen **之前**,于是端口被占时日志上写着启动成功、实际进程已经退了 ——
+		// 自更新失败最难查的就是这一点。
+		console.Error("启动失败:端口没能绑上", "addr", addr, "err", err)
+		state.Logger.Error("启动失败,端口 "+addr+" 没能绑上: "+err.Error(), "system")
+		state.Logger.Flush()
 		os.Exit(1)
 	}
+	console.Info("Listening", "addr", addr, "auth", enableAuth, "ui", hasUI(), "dataDir", paths.DataDir)
+	state.Logger.Info("已监听 "+addr+",开始对外服务", "system")
 	updater.MarkHealthy(state)
 
 	// 自更新完成后走这里:先停止接受新请求并等在途请求收尾,再关数据库,最后换进程映像。
 	// 顺序不能反 —— 先 exec 的话,新进程会发现端口还被自己占着。
 	gracefulRestart = func(exe string) {
+		// 必须在 Shutdown 之前置位:Shutdown 会让主 goroutine 里的 Serve 立刻返回,
+		// 而主 goroutine 要靠这个标记知道"别退出,等我 exec"。
+		restartPending.Store(true)
+
 		state.Logger.Info("[更新] 正在优雅关闭以完成重启", "version")
 		state.Logger.Flush()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -576,9 +586,26 @@ func main() {
 		if err := sqliteDB.Close(); err != nil {
 			console.Warn("close sqlite", "err", err)
 		}
+
+		// 走到这一步再记一笔并落盘:以前日志停在"正在优雅关闭"就没了,
+		// 根本分不清是没走到 exec、还是 exec 失败了。
+		state.Logger.Info("[更新] 准备用新二进制替换进程映像: "+exe, "version")
+		state.Logger.Flush()
+
 		if err := updater.Restart(exe); err != nil {
-			console.Error("restart", "err", err)
-			os.Exit(1)
+			// execve 失败(权限丢了、挂载带 noexec、ETXTBSY…)→ 退回"起个新进程再退出"。
+			// 比直接死掉强得多:用户手上这台正在跑抢购,停机就是错过补货。
+			state.Logger.Error("[更新] 替换进程映像失败: "+err.Error()+"，改用启动新进程的方式", "version")
+			state.Logger.Flush()
+			if serr := updater.Spawn(exe); serr != nil {
+				state.Logger.Error("[更新] 启动新进程也失败了: "+serr.Error()+"。请手动重启程序", "version")
+				state.Logger.Flush()
+				console.Error("restart", "err", err, "spawn", serr)
+				os.Exit(1)
+			}
+			state.Logger.Info("[更新] 新进程已拉起,当前进程退出", "version")
+			state.Logger.Flush()
+			os.Exit(0)
 		}
 	}
 
@@ -586,6 +613,50 @@ func main() {
 		console.Error("server run", "err", err)
 		os.Exit(1)
 	}
+
+	// Serve 返回了。如果是自更新触发的 Shutdown,**绝对不能让 main 返回** ——
+	// main 返回就是进程退出,而 exec 还排在另一个 goroutine 里(它得先等
+	// Shutdown 收尾、再关数据库)。
+	//
+	// 这正是之前"自更新后进程直接没了"的原因:Shutdown 让 Serve 立刻返回,
+	// 主 goroutine 跑完 main 就退出了,gracefulRestart 还卡在 sqliteDB.Close(),
+	// syscall.Exec 从来没执行过。日志上表现为"正在优雅关闭以完成重启"之后再无下文。
+	if restartPending.Load() {
+		// exec 成功 → 进程映像被换掉,下面这行永远等不到;
+		// exec 失败 → gracefulRestart 里自己 os.Exit。
+		// 兜底加个上限:万一两条路都没走通,别让用户对着一个挂死的进程干等。
+		time.Sleep(60 * time.Second)
+		state.Logger.Error("[更新] 等了 60 秒仍未完成重启,放弃并退出。请手动启动程序", "version")
+		state.Logger.Flush()
+		os.Exit(1)
+	}
+}
+
+// restartPending 标记"这次 Serve 退出是自更新计划内的"。
+var restartPending atomic.Bool
+
+// listenWithRetry 绑端口,短暂重试。
+//
+// 自更新是 execve:旧进程的监听 fd 虽然在 Shutdown 里关了,但内核回收、
+// 以及仍处于 TIME_WAIT 的连接,都可能让紧接着的 bind 撞上
+// "address already in use"。这是个几百毫秒的窗口,重试几次就过去了 ——
+// 而不重试的话,自更新会以"新版本起不来"收场,然后被回滚。
+//
+// 真的是别的进程占着端口时,重试几秒也还是失败,那时候才该报错退出。
+func listenWithRetry(addr string, state *app.State) (net.Listener, error) {
+	var lastErr error
+	for i := 0; i < 10; i++ {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			return ln, nil
+		}
+		lastErr = err
+		if i == 0 {
+			state.Logger.Warn("端口 "+addr+" 暂时绑不上,重试中: "+err.Error(), "system")
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return nil, lastErr
 }
 
 // mountEmbeddedUI 把嵌入的前端挂到根路径。
