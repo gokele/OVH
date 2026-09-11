@@ -78,13 +78,12 @@ func watchText(state *app.State, mon *monitor.Monitor, args []string) string {
 	accountID := ""
 	accLabel := ""
 	if autoOrder {
-		acc, ok := state.FindAccount("")
-		if !ok {
+		acc, ok := telegram.ActiveAccount(state)
+		if !ok && acc.ID == "" {
 			return "要自动下单得先配置 OVH 账户。请到控制台「设置 → OVH 账户」添加，或者去掉 x<数量> 只接收通知。"
 		}
 		accountID = acc.ID
-		sub := strings.ToUpper(strings.TrimSpace(acc.Zone))
-		accLabel = fmt.Sprintf("%s（子公司 %s）", acc.Name, sub)
+		accLabel = telegram.AccountLabel(acc)
 	}
 
 	if quantity > telegram.MaxOrderQuantity {

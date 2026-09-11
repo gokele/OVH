@@ -67,11 +67,13 @@ func ProcessOrder(state *app.State, planCode, datacenter string, quantity int, o
 	if quantity < 1 {
 		quantity = 1
 	}
-	// TG /buy 没有账户维度,落默认账户 —— 但必须在这里就把它解析成具体 ID 并写进队列项。
-	// 以前 QueueItem.AccountID 留空,下单时才由 purchase 现取默认账户:
-	// 中间只要有人改过默认账户(或删掉它),这一单就会用另一个账户、另一个区的凭据去下,
-	// 而可用性/目录判断用的还是此刻这个账户的子公司,两边对不上。
-	acc, ok := state.FindAccount("")
+	// 用 Telegram 侧当前选中的账户(/accounts 里切),没选过就是默认账户。
+	//
+	// 必须在这里就解析成具体 ID 并写进队列项:以前 QueueItem.AccountID 留空,
+	// 下单时才由 purchase 现取默认账户 —— 中间只要有人改过默认账户(或删掉它),
+	// 这一单就会用另一个账户、另一个区的凭据去下,而可用性/目录判断用的
+	// 还是此刻这个账户的子公司,两边对不上。
+	acc, ok := ActiveAccount(state)
 	if !ok {
 		return OrderResult{Success: false, Message: "未配置任何 OVH 账户"}
 	}

@@ -44,6 +44,9 @@ const (
 	stepConfig  flowStep = "config"
 	stepAccount flowStep = "account"
 	stepAction  flowStep = "action"
+	// stepSwitchAccount /accounts 里换当前账户。它不属于 /watch 那条流程,
+	// 只是复用同一套 token + 按钮机制。
+	stepSwitchAccount flowStep = "switch_account"
 )
 
 type configChoice struct {
@@ -253,9 +256,15 @@ func askAccount(state *app.State, f *watchFlow, chatID interface{}, messageID in
 	}
 	f.Step = stepAccount
 	tok := putFlow(f)
+	cur, _ := telegram.ActiveAccount(state)
 	labels := make([]string, 0, len(f.Accounts))
 	for _, a := range f.Accounts {
-		labels = append(labels, accountLabel(a))
+		l := accountLabel(a)
+		if a.ID == cur.ID {
+			// 标出当前账户 —— 用户多半就想用它,不标的话得自己回想哪个是哪个
+			l = "✅ " + l
+		}
+		labels = append(labels, l)
 	}
 	telegram.SendKeyboard(state, chatID, messageID,
 		"👤 用哪个账户？\n\n"+
@@ -330,6 +339,29 @@ func handleFlowCallback(state *app.State, mon *monitor.Monitor, cb map[string]in
 		}
 		telegram.AnswerCallback(state, fmt.Sprintf("%v", cb["id"]), "好", false)
 		askAction(state, f, chatID, messageID)
+		return true
+
+	case stepSwitchAccount:
+		if idx < 0 || idx >= len(f.Accounts) {
+			telegram.AnswerCallback(state, fmt.Sprintf("%v", cb["id"]), "选项无效", true)
+			return true
+		}
+		acc := f.Accounts[idx]
+		if err := telegram.SetActiveAccount(state, acc.ID); err != nil {
+			// 落库失败必须说。不说的话用户以为切了,下一单还是落在旧账户上,
+			// 而 planCode 是分区的 —— 后果是永远抢不到且看不出原因。
+			state.Logger.Error("保存 Telegram 当前账户失败: "+err.Error(), "telegram")
+			telegram.AnswerCallback(state, fmt.Sprintf("%v", cb["id"]), "保存失败", true)
+			telegram.SendReply(state, chatID, "⚠️ 切换失败，没能写进数据库："+err.Error()+"\n当前账户仍是原来那个。", messageID)
+			return true
+		}
+		state.Logger.Info("Telegram 当前账户切换为: "+acc.Name+" ("+acc.ID+")", "telegram")
+		telegram.AnswerCallback(state, fmt.Sprintf("%v", cb["id"]), "已切换", false)
+		telegram.SendReply(state, chatID,
+			"👤 当前账户已切换为：\n"+telegram.AccountLabel(acc)+
+				"\n\n之后的文本下单和 /watch 都会落到这个账户。\n"+
+				"注意：已经在队列里的任务和已存在的订阅不受影响，它们各自记着当初选的账户。",
+			messageID)
 		return true
 
 	case stepAction:

@@ -65,7 +65,7 @@ func handleCommand(state *app.State, mon *monitor.Monitor, chatID interface{}, m
 	case "unwatch", "uw":
 		reply = unwatchText(state, mon, args)
 	case "accounts", "acc":
-		reply = accountsText(state)
+		reply = accountsText(state, chatID, messageID)
 	case "subs", "sub":
 		reply = subsText(state, mon)
 	case "recent", "history":
@@ -73,7 +73,9 @@ func handleCommand(state *app.State, mon *monitor.Monitor, chatID interface{}, m
 	default:
 		reply = "❓ 不认识的命令: /" + cmd + "\n\n发 /help 看能用什么。"
 	}
-	telegram.SendReply(state, chatID, clampReply(reply), messageID)
+	if reply != "" {
+		telegram.SendReply(state, chatID, clampReply(reply), messageID)
+	}
 	return true
 }
 
@@ -112,9 +114,11 @@ func helpText() string {
 	b.WriteString("  /queue    正在抢的任务\n")
 	b.WriteString("  /cancel <任务号|all>  取消任务\n")
 	b.WriteString("  /subs     在盯哪些型号\n")
-	b.WriteString("  /accounts 可用的 OVH 账户\n")
+	b.WriteString("  /accounts 看/切当前下单账户\n")
 	b.WriteString("  /recent   最近的抢购结果\n\n")
 	b.WriteString("💡 上架通知里的按钮可以直接下单，比打字快。\n")
+	b.WriteString("💡 多账户的话先 /accounts 确认当前用的是哪个 —— ")
+	b.WriteString("三个大区的型号代码不一样，选错区永远抢不到。\n")
 	return b.String()
 }
 
@@ -139,6 +143,15 @@ func statusText(state *app.State, mon *monitor.Monitor) string {
 		if bad > 0 {
 			b.WriteString(fmt.Sprintf("⚠️ 其中 %d 个订阅最近一次检查失败，发 /subs 看详情\n", bad))
 		}
+	}
+
+	// 当前账户必须在总览里 —— 它决定下单落到哪个区,而选错区的表现只是"抢不到"
+	if acc, explicit := telegram.ActiveAccount(state); acc.ID != "" {
+		b.WriteString("当前账户：" + telegram.AccountLabel(acc))
+		if !explicit {
+			b.WriteString("（默认）")
+		}
+		b.WriteString("\n")
 	}
 
 	pending, running, done, failed := queueCounts(state)
@@ -322,28 +335,48 @@ func orAny(dc string) string {
 	return dc
 }
 
-func accountsText(state *app.State) string {
-	state.AccountsMu.RLock()
-	accs := make([]types.OVHAccount, len(state.Accounts))
-	copy(accs, state.Accounts)
-	state.AccountsMu.RUnlock()
-
+// accountsText 列账户 + 让用户切。
+//
+// 返回空串表示已经用按钮自己回复了。
+//
+// 为什么要能切:planCode 是分区的(EU / US / CA 三套目录基本不重合),
+// 用错区的账户下单,OVH 返回的是 200 + 空数组而不是报错 ——
+// 表现就是"永远抢不到",用户完全看不出是账户选错了。
+// 以前 TG 这边连选都不能选,一律落默认账户。
+func accountsText(state *app.State, chatID interface{}, messageID int64) string {
+	accs := listAccounts(state)
 	if len(accs) == 0 {
 		return "还没有配置 OVH 账户。请到控制台「设置 → OVH 账户」添加。"
 	}
+	cur, explicit := telegram.ActiveAccount(state)
+
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("👤 OVH 账户（%d 个）\n\n", len(accs)))
-	for _, a := range accs {
-		b.WriteString("  • " + a.Name)
-		if a.IsDefault {
-			b.WriteString("（默认）")
-		}
-		// 大区决定能买到什么 —— 三区目录互不相通,同型号代码都不一样
-		b.WriteString("\n    子公司 " + strings.ToUpper(a.Zone))
-		b.WriteString("\n")
+	b.WriteString("👤 当前账户：" + telegram.AccountLabel(cur))
+	if !explicit {
+		b.WriteString("\n（没单独选过，用的是默认账户）")
 	}
-	b.WriteString("\n注意：三个大区的机型目录互不相通，同一台机器在不同区的型号代码不一样。")
-	return b.String()
+	b.WriteString("\n\n这个账户决定文本下单和 /watch 落到哪里。\n")
+	b.WriteString("三个大区的机型目录互不相通，同一台机器在不同区的型号代码不一样 ——\n")
+	b.WriteString("选错区的后果是永远抢不到，而且看不出原因。\n")
+
+	if len(accs) == 1 {
+		// 只有一个账户,没什么可切的
+		return b.String()
+	}
+
+	b.WriteString("\n要换就点下面：")
+	f := &watchFlow{Step: stepSwitchAccount, Accounts: accs}
+	tok := putFlow(f)
+	labels := make([]string, 0, len(accs))
+	for _, a := range accs {
+		l := telegram.AccountLabel(a)
+		if a.ID == cur.ID {
+			l = "✅ " + l
+		}
+		labels = append(labels, l)
+	}
+	telegram.SendKeyboard(state, chatID, messageID, b.String(), flowKeyboard(tok, labels))
+	return ""
 }
 
 func subsText(state *app.State, mon *monitor.Monitor) string {

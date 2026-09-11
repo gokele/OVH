@@ -71,7 +71,7 @@ func TestDumpAllTemplates(t *testing.T) {
 	fmt.Println(recentText(st))
 
 	banner("/accounts")
-	fmt.Println(accountsText(st))
+	fmt.Println(accountsText(st, int64(1), 1))
 
 	banner("/watch（没带参数 = 用法）")
 	fmt.Println(watchText(st, mon, nil))
